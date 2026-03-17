@@ -19,6 +19,8 @@ checkpoints/
 .DS_Store
 tmp
 .wandb
+ode/distilled_example_videos_share.tar.gz
+model/gemma/tokenizer.model
 
 # Model checkpoints
 *.ckpt
@@ -33,6 +35,7 @@ tmp
 *.jpg
 *.jpeg
 *.json
+*.log
 *.m4a
 *.mov
 *.mp4
