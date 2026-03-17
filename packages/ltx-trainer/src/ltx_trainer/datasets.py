@@ -231,8 +231,11 @@ class PrecomputedDataset(Dataset):
             try:
                 data = torch.load(file_path, map_location="cpu", weights_only=True)
 
-                # Normalize video latent format if this is a latent source
-                if "latent" in dir_name.lower():
+                # Normalize latent payloads while preserving backward compatibility.
+                # Video latents use [C, F, H, W] metadata; audio latents use [C, T, F].
+                if dir_name == "audio_latents":
+                    data = self._normalize_audio_latents(data)
+                elif "latent" in dir_name.lower():
                     data = self._normalize_video_latents(data)
 
                 result[output_key] = data
@@ -249,26 +252,62 @@ class PrecomputedDataset(Dataset):
         Normalize video latents to non-patchified format [C, F, H, W].
         Used for keeping backward compatibility with legacy datasets.
         """
-        latents = data["latents"]
-
-        # Check if latents are in legacy patchified format [seq_len, C]
-        if latents.dim() == 2:
-            # Legacy format: [seq_len, C] where seq_len = F * H * W
-            num_frames = data["num_frames"]
-            height = data["height"]
-            width = data["width"]
-
-            # Unpatchify: [seq_len, C] -> [C, F, H, W]
-            latents = rearrange(
-                latents,
+        def _maybe_unpatchify(latent_tensor: Tensor, num_frames: int, height: int, width: int) -> Tensor:
+            if latent_tensor.dim() != 2:
+                return latent_tensor
+            return rearrange(
+                latent_tensor,
                 "(f h w) c -> c f h w",
                 f=num_frames,
                 h=height,
                 w=width,
             )
 
-            # Update the data dict with unpatchified latents
-            data = data.copy()
-            data["latents"] = latents
+        num_frames = data["num_frames"]
+        height = data["height"]
+        width = data["width"]
 
-        return data
+        normalized = data.copy()
+        normalized["latents"] = _maybe_unpatchify(data["latents"], num_frames, height, width)
+
+        if "ode_target_latents" in normalized:
+            normalized["ode_target_latents"] = _maybe_unpatchify(
+                normalized["ode_target_latents"],
+                num_frames,
+                height,
+                width,
+            )
+
+        return normalized
+
+    @staticmethod
+    def _normalize_audio_latents(data: dict) -> dict:
+        """
+        Normalize audio latents to non-patchified format [C, T, F].
+        Used for keeping backward compatibility with legacy datasets.
+        """
+
+        def _maybe_unpatchify(latent_tensor: Tensor, num_time_steps: int, frequency_bins: int) -> Tensor:
+            if latent_tensor.dim() != 2:
+                return latent_tensor
+            return rearrange(
+                latent_tensor,
+                "t (c f) -> c t f",
+                t=num_time_steps,
+                f=frequency_bins,
+            )
+
+        num_time_steps = data["num_time_steps"]
+        frequency_bins = data["frequency_bins"]
+
+        normalized = data.copy()
+        normalized["latents"] = _maybe_unpatchify(data["latents"], num_time_steps, frequency_bins)
+
+        if "ode_target_latents" in normalized:
+            normalized["ode_target_latents"] = _maybe_unpatchify(
+                normalized["ode_target_latents"],
+                num_time_steps,
+                frequency_bins,
+            )
+
+        return normalized

@@ -313,6 +313,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     self.audio_to_video_attn(
                         vx_scaled,
                         context=ax_scaled,
+                        mask=video.cross_attention_mask,
                         pe=video.cross_positional_embeddings,
                         k_pe=audio.cross_positional_embeddings,
                     )
@@ -345,6 +346,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     self.video_to_audio_attn(
                         ax_scaled,
                         context=vx_scaled,
+                        mask=audio.cross_attention_mask,
                         pe=audio.cross_positional_embeddings,
                         k_pe=video.cross_positional_embeddings,
                     )

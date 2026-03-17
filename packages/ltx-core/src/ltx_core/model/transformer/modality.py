@@ -1,6 +1,14 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    from torch.nn.attention.flex_attention import BlockMask
+else:
+    BlockMask = Any
 
 
 @dataclass(frozen=True)
@@ -19,11 +27,11 @@ class Modality:
         context: Text conditioning embeddings from the prompt encoder.
         enabled: Whether this modality is active in the current forward pass.
         context_mask: Optional mask for the text context tokens.
-        attention_mask: Optional 2-D self-attention mask, shape ``(B, T, T)``.
-            Values in ``[0, 1]`` where ``1`` = full attention and ``0`` = no
-            attention. ``None`` means unrestricted (full) attention between
-            all tokens. Built incrementally by conditioning items; see
-            :class:`~ltx_core.conditioning.types.attention_strength_wrapper.ConditioningItemAttentionStrengthWrapper`.
+        attention_mask: Optional self-attention mask. Can be either a dense
+            tensor of shape ``(B, T, T)`` with values in ``[0, 1]`` or a
+            ``BlockMask`` for sparse block-causal attention.
+        cross_attention_mask: Optional cross-modal attention mask. Can be
+            either a dense tensor of shape ``(B, T, S)`` or a ``BlockMask``.
     """
 
     latent: (
@@ -37,4 +45,5 @@ class Modality:
     context: torch.Tensor
     enabled: bool = True
     context_mask: torch.Tensor | None = None
-    attention_mask: torch.Tensor | None = None
+    attention_mask: torch.Tensor | BlockMask | None = None
+    cross_attention_mask: torch.Tensor | BlockMask | None = None

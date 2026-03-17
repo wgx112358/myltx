@@ -1,6 +1,12 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 
 import torch
+try:
+    from torch.nn.attention.flex_attention import BlockMask
+except ImportError:
+    BlockMask = None  # type: ignore[assignment]
 
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle
 from ltx_core.model.transformer.modality import Modality
@@ -25,9 +31,8 @@ class TransformerArgs:
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
     prompt_timestep: torch.Tensor | None = None
-    self_attention_mask: torch.Tensor | None = (
-        None  # Additive log-space self-attention bias (B, 1, T, T), None = full attention
-    )
+    self_attention_mask: torch.Tensor | BlockMask | None = None
+    cross_attention_mask: torch.Tensor | BlockMask | None = None
 
 
 class TransformerArgsPreprocessor:
@@ -94,20 +99,18 @@ class TransformerArgsPreprocessor:
             (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
         ) * torch.finfo(x_dtype).max
 
-    def _prepare_self_attention_mask(
-        self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype
-    ) -> torch.Tensor | None:
-        """Prepare self-attention mask by converting [0,1] values to additive log-space bias.
-        Input shape: (B, T, T) with values in [0, 1].
-        Output shape: (B, 1, T, T) with 0.0 for full attention and a large negative value
-        for masked positions.
-        Positions with attention_mask <= 0 are fully masked (mapped to the dtype's minimum
-        representable value). Strictly positive entries are converted via log-space for
-        smooth attenuation, with small values clamped for numerical stability.
-        Returns None if input is None (no masking).
-        """
+    @staticmethod
+    def _is_block_mask(attention_mask: object | None) -> bool:
+        return BlockMask is not None and isinstance(attention_mask, BlockMask)
+
+    def _prepare_sequence_attention_mask(
+        self, attention_mask: torch.Tensor | BlockMask | None, x_dtype: torch.dtype
+    ) -> torch.Tensor | BlockMask | None:
+        """Prepare a dense sequence attention mask or pass sparse masks through unchanged."""
         if attention_mask is None:
             return None
+        if self._is_block_mask(attention_mask):
+            return attention_mask
 
         # Convert [0, 1] attention mask to additive log-space bias:
         #   1.0 -> log(1.0) = 0.0  (no bias, full attention)
@@ -171,7 +174,11 @@ class TransformerArgsPreprocessor:
             num_attention_heads=self.num_attention_heads,
             x_dtype=modality.latent.dtype,
         )
-        self_attention_mask = self._prepare_self_attention_mask(modality.attention_mask, modality.latent.dtype)
+        self_attention_mask = self._prepare_sequence_attention_mask(modality.attention_mask, modality.latent.dtype)
+        cross_attention_mask = self._prepare_sequence_attention_mask(
+            modality.cross_attention_mask,
+            modality.latent.dtype,
+        )
         return TransformerArgs(
             x=x,
             context=context,
@@ -185,6 +192,7 @@ class TransformerArgsPreprocessor:
             enabled=modality.enabled,
             prompt_timestep=prompt_timestep,
             self_attention_mask=self_attention_mask,
+            cross_attention_mask=cross_attention_mask,
         )
 
 

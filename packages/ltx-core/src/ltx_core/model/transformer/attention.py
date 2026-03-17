@@ -2,6 +2,11 @@ from enum import Enum
 from typing import Protocol
 
 import torch
+try:
+    from torch.nn.attention.flex_attention import BlockMask, flex_attention
+except ImportError:
+    BlockMask = None  # type: ignore[assignment]
+    flex_attention = None
 
 from ltx_core.model.transformer.rope import LTXRopeType, apply_rotary_emb
 
@@ -19,16 +24,59 @@ except ImportError:
     flash_attn_interface = None
 
 
+def _is_block_mask(mask: object | None) -> bool:
+    return BlockMask is not None and isinstance(mask, BlockMask)
+
+
+def _compile_flex_attention():
+    if flex_attention is None or not hasattr(torch, "compile"):
+        return None
+
+    try:
+        return torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+    except Exception:
+        return None
+
+
+compiled_flex_attention = _compile_flex_attention()
+
+
 class AttentionCallable(Protocol):
     def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: object | None = None
     ) -> torch.Tensor: ...
+
+
+class FlexAttention(AttentionCallable):
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads: int,
+        mask: object | None = None,
+    ) -> torch.Tensor:
+        if not _is_block_mask(mask):
+            raise TypeError("FlexAttention requires a torch.nn.attention.flex_attention.BlockMask")
+        if flex_attention is None:
+            raise RuntimeError("BlockMask attention requires torch.nn.attention.flex_attention support.")
+
+        b, _, dim_head = q.shape
+        dim_head //= heads
+        q, k, v = (t.view(b, -1, heads, dim_head).transpose(1, 2) for t in (q, k, v))
+
+        attention_runner = compiled_flex_attention if q.is_cuda and compiled_flex_attention is not None else flex_attention
+        out = attention_runner(query=q, key=k, value=v, block_mask=mask)
+        return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
 
 
 class PytorchAttention(AttentionCallable):
     def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: object | None = None
     ) -> torch.Tensor:
+        if _is_block_mask(mask):
+            return FlexAttention()(q, k, v, heads, mask)
+
         b, _, dim_head = q.shape
         dim_head //= heads
         q, k, v = (t.view(b, -1, heads, dim_head).transpose(1, 2) for t in (q, k, v))
@@ -53,8 +101,10 @@ class XFormersAttention(AttentionCallable):
         k: torch.Tensor,
         v: torch.Tensor,
         heads: int,
-        mask: torch.Tensor | None = None,
+        mask: object | None = None,
     ) -> torch.Tensor:
+        if _is_block_mask(mask):
+            return FlexAttention()(q, k, v, heads, mask)
         if memory_efficient_attention is None:
             raise RuntimeError("XFormersAttention was selected but `xformers` is not installed.")
 
@@ -98,8 +148,10 @@ class FlashAttention3(AttentionCallable):
         k: torch.Tensor,
         v: torch.Tensor,
         heads: int,
-        mask: torch.Tensor | None = None,
+        mask: object | None = None,
     ) -> torch.Tensor:
+        if _is_block_mask(mask):
+            return FlexAttention()(q, k, v, heads, mask)
         if flash_attn_interface is None:
             raise RuntimeError("FlashAttention3 was selected but `FlashAttention3` is not installed.")
 
@@ -123,8 +175,10 @@ class AttentionFunction(Enum):
     DEFAULT = "default"
 
     def __call__(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: object | None = None
     ) -> torch.Tensor:
+        if _is_block_mask(mask):
+            return FlexAttention()(q, k, v, heads, mask)
         if self is AttentionFunction.PYTORCH:
             return PytorchAttention()(q, k, v, heads, mask)
         elif self is AttentionFunction.XFORMERS:
@@ -181,7 +235,7 @@ class Attention(torch.nn.Module):
         self,
         x: torch.Tensor,
         context: torch.Tensor | None = None,
-        mask: torch.Tensor | None = None,
+        mask: object | None = None,
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
         perturbation_mask: torch.Tensor | None = None,
@@ -229,7 +283,10 @@ class Attention(torch.nn.Module):
                 q = apply_rotary_emb(q, pe, self.rope_type)
                 k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
 
-            out = self.attention_function(q, k, v, self.heads, mask)  # (B, T, H*D)
+            if _is_block_mask(mask):
+                out = FlexAttention()(q, k, v, self.heads, mask)
+            else:
+                out = self.attention_function(q, k, v, self.heads, mask)  # (B, T, H*D)
 
             if perturbation_mask is not None:
                 out = out * perturbation_mask + v * (1 - perturbation_mask)

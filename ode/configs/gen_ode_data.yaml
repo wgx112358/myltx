@@ -4,13 +4,16 @@
 # Stage 2: 1024x1536 全分辨率，从 Stage1 upsampled latent 加噪后跑，保存 4 个 checkpoint
 
 # ── 模型路径 ─────────────────────────────────────────────────────────────────
-checkpoint_path: /mnt/shared-storage-user/worldmodel-shared/wgx/ltx-2.0_old_1/models/ltx-2.3-22b-dev.safetensors
-gemma_root: /mnt/shared-storage-user/worldmodel-shared/wgx/ltx-2.0_old_1/models/gemma3
-spatial_upsampler_path: /mnt/shared-storage-user/worldmodel-shared/wgx/ltx-2.0_old_1/models/ltx2/ltx-2.3-spatial-upscaler-x2-1.0.safetensors
+checkpoint_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/ltx-2.3-22b-dev.safetensors
+gemma_root: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/gemma
+spatial_upsampler_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/ltx-2.3-spatial-upscaler-x2-1.0.safetensors
+# 官方 two-stage 的 Stage 2 使用 distilled LoRA refinement
+distilled_lora_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/ltx-2.3-22b-distilled-lora-384.safetensors
+distilled_lora_strength: 1.0
 
 # ── 数据路径 ─────────────────────────────────────────────────────────────────
-caption_path: /mnt/shared-storage-user/worldmodel-shared/wgx/LTX-2/datagen/ltx_prompts_12000.csv
-output_dir: /mnt/shared-storage-user/worldmodel-shared/wgx/LTX-2/ode/data
+caption_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/datagen/ltx_prompts_12000.csv
+output_dir: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data
 
 # ── 视频参数 ─────────────────────────────────────────────────────────────────
 # Stage 1 分辨率（Stage 2 自动 2x）
@@ -23,7 +26,8 @@ frame_rate: 24.0
 teacher_steps: 40           # 教师模型推理步数（与蒸馏 sigma 对齐的最优步数）
 seed: 42
 
-# CFG guidance scale
+# guider 参数默认会自动跟随官方 detect_params()；
+# 这里只覆盖最常改的 cfg scale，其它 stg/rescale/modality/skip_step/stg_blocks 若不写则走官方默认值。
 video_cfg_scale: 3.0
 audio_cfg_scale: 7.0
 
@@ -39,3 +43,19 @@ negative_prompt: >
 max_samples: -1
 # prompt CSV 中文本列名
 prompt_column: text_prompt
+# prompt context 的磁盘缓存目录；为空则默认放到 output_dir 同级目录
+prompt_ctx_cache_dir: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data_prompt_ctx_cache
+# 每批预编码多少条 prompt 到磁盘，再进入 ODE 生成。
+# 该值越小：Gemma 峰值显存/临时磁盘占用越低，但预编码批次更多。
+prompt_ctx_batch_size: 512
+# prompt 预编码模式：
+# - staged: 先只跑 text_encoder 到 CPU，再单独跑 embeddings_processor，最适合省显存
+# - fast: text_encoder + embeddings_processor 同时驻留 GPU，最快但峰值更高
+# - sequential: 每条 prompt 单独两阶段编码，最稳但最慢
+prompt_ctx_preencode_mode: staged
+# 单条样本成功生成后，是否立刻删除对应的 prompt context cache
+delete_prompt_ctx_after_use: true
+# Stage 2 成功完成后，是否删除 Stage 1 的临时中间结果缓存
+delete_stage1_artifact_after_use: true
+# 每条样本完成后是否主动 gc + empty_cache，减少长任务显存碎片
+cleanup_after_each_sample: true
