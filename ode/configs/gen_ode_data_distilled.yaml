@@ -1,0 +1,48 @@
+# ODE 轨迹数据生成配置（蒸馏模型版本）
+# 蒸馏模型使用固定 sigma 调度，无需 CFG。
+# Stage 1: 512x768 半分辨率，8 步去噪，保存 9 个状态
+# Stage 2: 1024x1536 全分辨率，3 步去噪，保存 4 个状态
+
+# ── 模型路径 ─────────────────────────────────────────────────────────────────
+checkpoint_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/ltx-2.3-22b-distilled.safetensors
+gemma_root: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/gemma
+spatial_upsampler_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/ltx-2.3-spatial-upscaler-x2-1.0.safetensors
+
+# ── 数据路径 ─────────────────────────────────────────────────────────────────
+caption_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/datagen/ltx_prompts_12000.csv
+output_dir: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data_distilled
+# prompt context 的磁盘缓存目录；为空则默认放到 output_dir 同级目录
+prompt_ctx_cache_dir: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data_distilled_prompt_ctx_cache
+
+# ── 视频参数 ─────────────────────────────────────────────────────────────────
+# Stage 1 分辨率（Stage 2 自动 2x）
+stage1_height: 512
+stage1_width: 768
+num_frames: 121   # 必须满足 (num_frames - 1) % 8 == 0
+frame_rate: 24.0
+
+# ── 扩散参数 ─────────────────────────────────────────────────────────────────
+seed: 42
+# 蒸馏模型不使用 CFG，无需 negative_prompt 和 cfg_scale
+
+# ── 运行参数 ─────────────────────────────────────────────────────────────────
+# 处理的 prompt 数量上限（-1 表示全部）
+max_samples: -1
+# prompt CSV 中文本列名
+prompt_column: text_prompt
+# 每批预编码多少条 prompt 到磁盘，再加载一次 transformer 生成 ODE。
+# 该值越小：峰值显存/临时磁盘占用越低，但 transformer 反复加载越多，速度更慢。
+# 设为 -1 表示当前 chunk 全部 prompt 先预编码后再一次性生成，速度更好，但磁盘占用最高。
+prompt_ctx_batch_size: 512
+# prompt 预编码模式：
+# - staged: 先只跑 text_encoder 到 CPU，再单独跑 embeddings_processor，最适合省显存
+# - fast: text_encoder + embeddings_processor 同时驻留 GPU，最快但峰值更高
+# - sequential: 每条 prompt 单独两阶段编码，最稳但最慢
+prompt_ctx_preencode_mode: staged
+# 单条样本成功生成后，是否立刻删除对应的 prompt context cache，避免磁盘越堆越大。
+delete_prompt_ctx_after_use: true
+# Stage 1 跑完后是否先把 transformer 挪回 CPU，再加载 video_encoder + upsampler 做 Stage 2 准备。
+# 开启后更省显存，但每条样本会多一次 transformer CPU/GPU 往返。
+offload_transformer_for_upsample: true
+# 每条样本完成后是否主动 gc + empty_cache，进一步压低碎片化和保留显存。
+cleanup_after_each_sample: true

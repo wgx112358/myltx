@@ -38,6 +38,10 @@ training_strategy:
   loss_reweight_mode: "manual"
   video_loss_weight: 1.0
   audio_loss_weight: 1.0
+  use_block_causal_mask: true
+  block_size: 6
+  independent_first_frame: true
+  audio_boundary_mode: "left"
 
 optimization:
   learning_rate: 1.0e-4
@@ -56,8 +60,8 @@ acceleration:
   load_text_encoder_in_8bit: false
 
 data:
-  preprocessed_data_root: "/path/to/ode-precomputed-dataset"
-  num_dataloader_workers: 2
+  preprocessed_data_root: "/inspire/qb-ilm/project/agileapplication/zhangkaipeng-24043/wgx/ode_data/precompute"
+  num_dataloader_workers: 8
 
 validation:
   prompts:
@@ -79,7 +83,7 @@ validation:
 
 checkpoints:
   interval: 250
-  keep_last_n: -1
+  keep_last_n: 2
   precision: "bfloat16"
 
 flow_matching:
@@ -99,4 +103,4 @@ wandb:
   log_validation_videos: true
 
 seed: 42
-output_dir: "outputs/ode_regression"
+output_dir: "/inspire/qb-ilm/project/agileapplication/zhangkaipeng-24043/wgx/ode_ckpt"

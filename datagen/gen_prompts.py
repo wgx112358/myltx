@@ -25,7 +25,7 @@ from tqdm import tqdm
 
 # ============== 硬编码配置 ==============
 API_KEY = "sk-Zl0CgSxEPikuXrmGFcn2yV83IZ37ahGzHEQ7Ncs075zwZsL3"
-API_BASE = "https://api.xcode.best/v1"
+API_BASE = "https://api.xcode.best"
 MODEL = "gpt-5.4"
 # ========================================
 OUTPUT_CSV = "ltx_prompts.csv"
