@@ -90,6 +90,7 @@ class LtxvTrainer:
         self._dataset = None
         self._global_step = -1
         self._checkpoint_paths = []
+        self._loss_ema: float | None = None
         self._init_wandb()
 
     def train(  # noqa: PLR0912, PLR0915
@@ -143,6 +144,8 @@ class LtxvTrainer:
         peak_mem_during_training = start_mem
 
         sampled_videos_paths = None
+        accumulated_loss = 0.0
+        accumulation_count = 0
 
         with progress:
             # Initial validation before training starts
@@ -168,6 +171,9 @@ class LtxvTrainer:
                         self._global_step += 1
 
                     loss = self._training_step(batch)
+                    loss_scalar = float(loss.detach().item())
+                    accumulated_loss += loss_scalar
+                    accumulation_count += 1
                     self._accelerator.backward(loss)
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
@@ -220,9 +226,12 @@ class LtxvTrainer:
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
+                    optimizer_step_loss = (
+                        accumulated_loss / accumulation_count if accumulation_count > 0 else loss_scalar
+                    )
 
                     progress.update_training(
-                        loss=loss.item(),
+                        loss=optimizer_step_loss if is_optimization_step else loss_scalar,
                         lr=current_lr,
                         step_time=step_time,
                         advance=is_optimization_step,
@@ -230,17 +239,29 @@ class LtxvTrainer:
 
                     # Log metrics to W&B (only on main process and optimization steps)
                     if IS_MAIN_PROCESS and is_optimization_step:
-                        self._log_metrics(
-                            {
-                                "train/loss": loss.item(),
-                                "train/learning_rate": current_lr,
-                                "train/step_time": step_time,
-                                "train/global_step": self._global_step,
-                            }
-                        )
+                        metrics = {
+                            "train/loss": optimizer_step_loss,
+                            "train/learning_rate": current_lr,
+                            "train/step_time": step_time,
+                            "train/global_step": self._global_step,
+                        }
+                        if self._config.wandb.log_loss_ema:
+                            metrics["train/loss_ema"] = self._update_loss_ema(optimizer_step_loss)
+
+                        if self._should_log_training_metrics():
+                            self._log_metrics(metrics, step=self._global_step)
+
+                    if is_optimization_step:
+                        accumulated_loss = 0.0
+                        accumulation_count = 0
 
                     # Fallback logging when progress bars are disabled
-                    if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
+                    if (
+                        disable_progress_bars
+                        and IS_MAIN_PROCESS
+                        and is_optimization_step
+                        and self._should_log_console_step()
+                    ):
                         elapsed = time.time() - train_start_time
                         progress_percentage = self._global_step / cfg.optimization.steps
                         if progress_percentage > 0:
@@ -248,9 +269,12 @@ class LtxvTrainer:
                             total_time = f"{total_estimated // 3600:.0f}h {(total_estimated % 3600) // 60:.0f}m"
                         else:
                             total_time = "calculating..."
+                        ema_suffix = ""
+                        if self._config.wandb.log_loss_ema and self._loss_ema is not None:
+                            ema_suffix = f", Loss EMA: {self._loss_ema:.4f}"
                         logger.info(
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
-                            f"Loss: {loss.item():.4f}, LR: {current_lr:.2e}, "
+                            f"Loss: {optimizer_step_loss:.4f}{ema_suffix}, LR: {current_lr:.2e}, "
                             f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
                         )
 
@@ -297,7 +321,8 @@ class LtxvTrainer:
                         "stats/steps_per_second": stats.steps_per_second,
                         "stats/samples_per_second": stats.samples_per_second,
                         "stats/peak_gpu_memory_gb": stats.peak_gpu_memory_gb,
-                    }
+                    },
+                    step=self._global_step,
                 )
                 self._wandb_run.finish()
 
@@ -976,16 +1001,37 @@ class LtxvTrainer:
         run = wandb.init(
             project=wandb_config.project,
             entity=wandb_config.entity,
-            name=Path(self._config.output_dir).name,
+            name=wandb_config.name or Path(self._config.output_dir).name,
+            mode=wandb_config.mode,
             tags=wandb_config.tags,
             config=self._config.model_dump(),
         )
+        run.define_metric("train/global_step")
+        run.define_metric("train/*", step_metric="train/global_step")
+        run.define_metric("stats/*", step_metric="train/global_step")
         self._wandb_run = run
 
-    def _log_metrics(self, metrics: dict[str, float]) -> None:
+    def _log_metrics(self, metrics: dict[str, float], step: int | None = None) -> None:
         """Log metrics to Weights & Biases."""
         if self._wandb_run is not None:
-            self._wandb_run.log(metrics)
+            self._wandb_run.log(metrics, step=step)
+
+    def _update_loss_ema(self, loss_value: float) -> float:
+        """Update and return the exponential moving average of the training loss."""
+        beta = self._config.wandb.loss_ema_beta
+        if self._loss_ema is None:
+            self._loss_ema = loss_value
+        else:
+            self._loss_ema = beta * self._loss_ema + (1.0 - beta) * loss_value
+        return self._loss_ema
+
+    def _should_log_training_metrics(self) -> bool:
+        """Whether the current optimizer step should be logged to W&B."""
+        return self._global_step == 1 or self._global_step % self._config.wandb.train_log_interval == 0
+
+    def _should_log_console_step(self) -> bool:
+        """Whether the current optimizer step should be printed when progress bars are disabled."""
+        return self._global_step == 1 or self._global_step % self._config.wandb.console_log_interval == 0
 
     def _log_validation_samples(self, sample_paths: list[Path], prompts: list[str]) -> None:
         """Log validation samples (videos or images) to Weights & Biases."""

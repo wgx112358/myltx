@@ -436,9 +436,43 @@ class WandbConfig(ConfigBaseModel):
         description="W&B username or team",
     )
 
+    name: str | None = Field(
+        default=None,
+        description="Optional explicit W&B run name. Defaults to the output directory name when omitted.",
+    )
+
+    mode: Literal["online", "offline"] = Field(
+        default="online",
+        description="W&B logging mode. Use offline to store runs locally and sync later.",
+    )
+
     tags: list[str] = Field(
         default_factory=list,
         description="Tags to add to the W&B run",
+    )
+
+    train_log_interval: int = Field(
+        default=1,
+        description="How often to log training metrics to W&B, measured in optimizer steps.",
+        ge=1,
+    )
+
+    console_log_interval: int = Field(
+        default=20,
+        description="How often to print fallback training logs when progress bars are disabled, measured in optimizer steps.",
+        ge=1,
+    )
+
+    log_loss_ema: bool = Field(
+        default=True,
+        description="Whether to log an exponential moving average of the training loss.",
+    )
+
+    loss_ema_beta: float = Field(
+        default=0.98,
+        description="Smoothing factor for the logged exponential moving average of loss.",
+        ge=0.0,
+        lt=1.0,
     )
 
     log_validation_videos: bool = Field(

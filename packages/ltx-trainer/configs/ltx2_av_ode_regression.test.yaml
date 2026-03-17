@@ -1,0 +1,90 @@
+# =============================================================================
+# LTX-2 Audio-Video ODE Regression Smoke Test Configuration
+# =============================================================================
+
+model:
+  model_path: "/inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/gemma"
+  training_mode: "lora"
+  load_checkpoint: null
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "ode_regression"
+  with_audio: true
+  audio_latents_dir: "audio_latents"
+  sigma_epsilon: 1.0e-6
+  loss_reweight_mode: "manual"
+  video_loss_weight: 1.0
+  audio_loss_weight: 1.0
+
+optimization:
+  learning_rate: 1.0e-4
+  steps: 2
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "linear"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+
+data:
+  preprocessed_data_root: "/inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data_distilled_stage2_ode_test"
+  num_dataloader_workers: 2
+
+validation:
+  prompts:
+    - "A calm documentary-style close shot of a woman shaping dough on a wooden counter while a kettle hums softly in the background."
+  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  images: null
+  video_dims: [576, 576, 89]
+  frame_rate: 24.0
+  seed: 42
+  inference_steps: 30
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_av"
+  generate_audio: true
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 250
+  keep_last_n: -1
+  precision: "bfloat16"
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+
+wandb:
+  enabled: false
+  project: "ltxv-ode-regression"
+  entity: "wgx11235-hit"
+  name: null
+  mode: "online"
+  tags: ["ode_regression", "block_causal", "smoke_test"]
+  train_log_interval: 1
+  console_log_interval: 1
+  log_loss_ema: true
+  loss_ema_beta: 0.98
+  log_validation_videos: true
+
+seed: 42
+output_dir: "outputs/ode_regression_smoke_test"

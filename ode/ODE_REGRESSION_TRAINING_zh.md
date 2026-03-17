@@ -343,7 +343,70 @@
 - 文本 cross-attn 仍不做 temporal causal
 - `local_attn_size > 0` 的窗口裁剪逻辑已实现，但当前主验证使用的是默认 `-1`
 
-## 13. 推荐使用方式
+## 13. 训练时如何看 loss
+
+当前训练时的 loss 展示分成两路：
+
+- 终端进度条
+  - 默认就会显示当前训练 loss
+- Weights & Biases
+  - 会记录 `train/loss`
+  - 可选记录 `train/loss_ema`
+  - 同时记录 `train/learning_rate`
+  - 同时记录 `train/step_time`
+
+### 13.1 当前新增的 W&B 配置
+
+`packages/ltx-trainer/configs/ltx2_av_ode_regression.yaml` 里现在支持：
+
+- `wandb.enabled`
+  - 是否启用 W&B
+- `wandb.project`
+  - W&B project 名称
+- `wandb.entity`
+  - 你的用户名或 team
+- `wandb.name`
+  - run 名称
+  - 为空时默认使用 `output_dir` 的目录名
+- `wandb.mode`
+  - `online` 或 `offline`
+  - `offline` 适合先本地训练，之后再 `wandb sync`
+- `wandb.train_log_interval`
+  - 每多少个 optimizer step 向 W&B 记录一次训练指标
+- `wandb.console_log_interval`
+  - 关闭进度条时，每多少个 optimizer step 在终端打印一次 loss
+- `wandb.log_loss_ema`
+  - 是否额外记录平滑 loss
+- `wandb.loss_ema_beta`
+  - loss EMA 的平滑系数
+
+### 13.2 当前 loss 记录方式
+
+当前不是简单记录“最后一个 micro-batch 的瞬时 loss”，而是：
+
+- 先在一个 gradient accumulation 周期内累计 loss
+- 到 optimizer step 时取平均
+- 再把这个 optimizer-step loss 记录到 W&B
+
+这样做的好处是：
+
+- 当 `gradient_accumulation_steps > 1` 时，loss 曲线更符合真实训练步
+- W&B 的 step 轴会对齐 `train/global_step`
+
+### 13.3 当前建议
+
+如果你主要想看训练走势，建议：
+
+- `wandb.train_log_interval=1`
+- `wandb.log_loss_ema=true`
+- `wandb.loss_ema_beta=0.98`
+
+如果你希望更高频地在纯终端里看到 loss，可以：
+
+- 启动训练时加 `--disable-progress-bars`
+- 同时把 `wandb.console_log_interval` 调小，比如 `1` 或 `5`
+
+## 14. 推荐使用方式
 
 如果你要训练当前版本的 ODE regression，建议：
 
@@ -352,8 +415,9 @@
 3. 训练阶段保持 `use_block_causal_mask=True`
 4. 保持 `validate_audio_sigma_match=True`
 5. 不要手动删除 `ode_noise_seeds`
+6. 需要在线看 loss 时，保持 `wandb.enabled=True`
 
-## 14. 一句话总结
+## 15. 一句话总结
 
 当前这套 ODE regression 训练代码，已经从“能跑”推进到“训练逻辑、mask、sigma、噪声元信息都对齐，而且真实闭环跑通过”。
 
