@@ -47,3 +47,5 @@ class Modality:
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | BlockMask | None = None
     cross_attention_mask: torch.Tensor | BlockMask | None = None
+    sink_token_count: int = 0
+    prompt_sigma: torch.Tensor | None = None

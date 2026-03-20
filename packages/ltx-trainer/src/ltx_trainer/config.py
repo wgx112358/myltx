@@ -174,8 +174,19 @@ class AccelerationConfig(ConfigBaseModel):
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""
 
-    preprocessed_data_root: str = Field(
-        description="Path to folder containing preprocessed training data",
+    preprocessed_data_root: str | None = Field(
+        default=None,
+        description="Path to folder containing preprocessed training data for single-stage training.",
+    )
+
+    preprocessed_data_root_stage1: str | None = Field(
+        default=None,
+        description="Path to folder containing preprocessed stage1 ODE training data.",
+    )
+
+    preprocessed_data_root_stage2: str | None = Field(
+        default=None,
+        description="Path to folder containing preprocessed stage2 ODE training data.",
     )
 
     num_dataloader_workers: int = Field(
@@ -183,6 +194,14 @@ class DataConfig(ConfigBaseModel):
         description="Number of background processes for data loading (0 means synchronous loading)",
         ge=0,
     )
+
+    @field_validator("preprocessed_data_root", "preprocessed_data_root_stage1", "preprocessed_data_root_stage2")
+    @classmethod
+    def expand_data_roots(cls, v: str | None) -> str | None:
+        """Expand user home directory in configured dataset paths."""
+        if v is None:
+            return None
+        return str(Path(v).expanduser().resolve())
 
 
 class ValidationConfig(ConfigBaseModel):
@@ -553,5 +572,14 @@ class LtxTrainerConfig(ConfigBaseModel):
         # Check that LoRA config is provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
+
+        if self.training_strategy.name == "ode_regression" and self.training_strategy.dual_stage_training:
+            if self.data.preprocessed_data_root_stage1 is None or self.data.preprocessed_data_root_stage2 is None:
+                raise ValueError(
+                    "preprocessed_data_root_stage1 and preprocessed_data_root_stage2 must be provided "
+                    "when dual_stage_training=True"
+                )
+        elif self.data.preprocessed_data_root is None:
+            raise ValueError("preprocessed_data_root must be provided when dual-stage ODE training is disabled")
 
         return self

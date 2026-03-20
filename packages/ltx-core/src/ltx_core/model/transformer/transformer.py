@@ -164,6 +164,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         prompt_scale_shift_table: torch.Tensor | None,
         timestep: torch.Tensor,
         prompt_timestep: torch.Tensor | None,
+        prompt_timestep_is_per_query: bool,
         context_mask: torch.Tensor | None,
         cross_attention_adaln: bool = False,
     ) -> torch.Tensor:
@@ -179,6 +180,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 gate,
                 prompt_scale_shift_table,
                 prompt_timestep,
+                prompt_timestep_is_per_query,
                 context_mask,
                 self.norm_eps,
             )
@@ -241,6 +243,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 getattr(self, "prompt_scale_shift_table", None),
                 video.timesteps,
                 video.prompt_timestep,
+                video.prompt_timestep_is_per_query,
                 video.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
             )
@@ -279,6 +282,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 getattr(self, "audio_prompt_scale_shift_table", None),
                 audio.timesteps,
                 audio.prompt_timestep,
+                audio.prompt_timestep_is_per_query,
                 audio.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
             )
@@ -387,14 +391,59 @@ def apply_cross_attention_adaln(
     q_gate: torch.Tensor,
     prompt_scale_shift_table: torch.Tensor,
     prompt_timestep: torch.Tensor,
+    prompt_timestep_is_per_query: bool,
     context_mask: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> torch.Tensor:
     batch_size = x.shape[0]
-    shift_kv, scale_kv = (
-        prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
-        + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
-    ).unbind(dim=2)
     attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale) + q_shift
-    encoder_hidden_states = context * (1 + scale_kv) + shift_kv
-    return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
+    prompt_scale_shift = prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
+
+    if not prompt_timestep_is_per_query:
+        shift_kv, scale_kv = (
+            prompt_scale_shift + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
+        ).unbind(dim=2)
+        if scale_kv.shape[1] not in {1, context.shape[1]}:
+            raise ValueError(
+                "Prompt timestep must align with either the batch or prompt token axis when not using per-query prompt conditioning. "
+                f"Got prompt length {scale_kv.shape[1]} for context length {context.shape[1]}."
+            )
+        encoder_hidden_states = context * (1 + scale_kv) + shift_kv
+        return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
+
+    query_len = attn_input.shape[1]
+    if prompt_timestep.shape[1] != query_len:
+        raise ValueError(
+            "Per-query prompt conditioning requires one prompt timestep per query token. "
+            f"Got prompt length {prompt_timestep.shape[1]} for query length {query_len}."
+        )
+
+    output = torch.empty_like(attn_input)
+    for batch_index in range(batch_size):
+        sample_prompt_timestep = prompt_timestep[batch_index]
+        run_start = 0
+        while run_start < query_len:
+            run_end = run_start + 1
+            while run_end < query_len and torch.equal(
+                sample_prompt_timestep[run_end],
+                sample_prompt_timestep[run_start],
+            ):
+                run_end += 1
+
+            shift_kv, scale_kv = (
+                prompt_scale_shift + sample_prompt_timestep[run_start : run_start + 1].reshape(1, 1, 2, -1)
+            ).unbind(dim=2)
+            encoder_hidden_states = context[batch_index : batch_index + 1] * (1 + scale_kv) + shift_kv
+
+            chunk_mask = None
+            if context_mask is not None:
+                chunk_mask = context_mask[batch_index : batch_index + 1].expand(-1, -1, run_end - run_start, -1)
+
+            output[batch_index : batch_index + 1, run_start:run_end] = attn(
+                attn_input[batch_index : batch_index + 1, run_start:run_end],
+                context=encoder_hidden_states,
+                mask=chunk_mask,
+            )
+            run_start = run_end
+
+    return output * q_gate

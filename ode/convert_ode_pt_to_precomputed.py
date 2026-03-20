@@ -6,15 +6,19 @@
 
 默认行为：
 1. 读取 ode/configs/gen_ode_data_distilled.yaml，自动拿到 input/model/gemma/fps 默认值
-2. 从每个样本中选择 stage2 的最后一个轨迹状态（clean latent）
+2. 从每个样本中选择一个代表性 trajectory step 作为标准导出 latent；ODE regression
+   导出会自动固定使用内部代表步，不向用户暴露 step 选择参数
 3. 写出:
-   - <output_root>/.precomputed/latents/*.pt
-   - <output_root>/.precomputed/audio_latents/*.pt
+   - standard: <output_root>/.precomputed/latents/*.pt
+   - standard: <output_root>/.precomputed/audio_latents/*.pt
+   - ode_regression: <output_root>/.precomputed/ode_video_trajectories/*.pt
+   - ode_regression: <output_root>/.precomputed/ode_audio_trajectories/*.pt
    - <output_root>/.precomputed/conditions/*.pt
 
 输出格式会对齐 myltx/packages/ltx-trainer 的 PrecomputedDataset。
-当使用 `--export-mode ode_regression` 时，还会把当前 step 的 clean target 和 sigma
-一并写入 payload，供 `ltx-trainer` 的 ODE regression strategy 直接训练。
+当使用 `--export-mode ode_regression` 时，还会把完整 trajectory、clean target 和内部代表
+step 的 sigma 一并写入 payload，供 `ltx-trainer` 的 blockwise ODE regression strategy
+在训练时从 full trajectory 内部采样各个 block 的 step。
 
 示例：
     cd /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx
@@ -24,16 +28,15 @@
         --limit 10 \
         --no-write-conditions
 
-    # 转换 stage1 第 0 步 noisy latent，并写出 conditions
+    # 标准导出：转换 stage1 第 0 步 noisy latent，并写出 conditions
     python ode/convert_ode_pt_to_precomputed.py \
         --stage stage1 \
-        --trajectory-step 0 \
+        --standard-trajectory-step 0 \
         --output-dir ode/data_distilled_stage1_step0
 
-    # 导出 ODE regression 训练数据：把每条轨迹展开为多个 noisy->clean 训练样本
+    # 导出 ODE regression 训练数据：每条轨迹保留为一个 full-trajectory 训练样本
     python ode/convert_ode_pt_to_precomputed.py \
         --export-mode ode_regression \
-        --trajectory-step all_non_last \
         --output-dir ode/data_distilled_stage2_ode
 """
 
@@ -62,6 +65,11 @@ PRECOMPUTED_DIR_NAME = ".precomputed"
 SUPPORTED_STAGES = ("stage1", "stage2")
 EXPORT_MODES = ("standard", "ode_regression")
 VIDEO_TEMPORAL_COMPRESSION = 8
+STANDARD_VIDEO_DIR_NAME = "latents"
+STANDARD_AUDIO_DIR_NAME = "audio_latents"
+ODE_VIDEO_DIR_NAME = "ode_video_trajectories"
+ODE_AUDIO_DIR_NAME = "ode_audio_trajectories"
+CONDITIONS_DIR_NAME = "conditions"
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,12 +104,12 @@ def parse_args() -> argparse.Namespace:
         help="Which ODE stage to export as training latents.",
     )
     parser.add_argument(
-        "--trajectory-step",
+        "--standard-trajectory-step",
         type=str,
         default="last",
         help=(
-            'Which trajectory state(s) to export: "first", "last", "all", "all_non_last", '
-            'or an integer index.'
+            'Standard export only: which trajectory state(s) to export: "first", "last", "all", '
+            '"all_non_last", or an integer index.'
         ),
     )
     parser.add_argument(
@@ -201,13 +209,13 @@ def resolve_output_root(
     output_dir: Path | None,
     input_dir: Path,
     stage: str,
-    trajectory_step: str,
+    trajectory_step_label: str,
     export_mode: str,
 ) -> Path:
     if output_dir is not None:
         return output_dir.expanduser().resolve()
 
-    step_label = trajectory_step.strip().lower()
+    step_label = trajectory_step_label.strip().lower()
     default_name = f"{input_dir.name}_{stage}_{step_label}"
     if export_mode != "standard":
         default_name = f"{default_name}_{export_mode}"
@@ -218,6 +226,18 @@ def resolve_precomputed_root(output_root: Path) -> Path:
     if output_root.name == PRECOMPUTED_DIR_NAME:
         return output_root
     return output_root / PRECOMPUTED_DIR_NAME
+
+
+def resolve_video_dir_name(export_mode: str) -> str:
+    if export_mode == "ode_regression":
+        return ODE_VIDEO_DIR_NAME
+    return STANDARD_VIDEO_DIR_NAME
+
+
+def resolve_audio_dir_name(export_mode: str) -> str:
+    if export_mode == "ode_regression":
+        return ODE_AUDIO_DIR_NAME
+    return STANDARD_AUDIO_DIR_NAME
 
 
 def parse_dtype(dtype_name: str) -> torch.dtype:
@@ -251,7 +271,9 @@ def resolve_step_index(step_spec: str, trajectory_length: int) -> int:
     try:
         raw_index = int(normalized)
     except ValueError as exc:
-        raise ValueError(f'Invalid --trajectory-step "{step_spec}". Use first/last or an integer.') from exc
+        raise ValueError(
+            f'Invalid --standard-trajectory-step "{step_spec}". Use first/last or an integer.'
+        ) from exc
 
     if raw_index < 0:
         raw_index += trajectory_length
@@ -269,6 +291,9 @@ def resolve_step_indices(step_spec: str, trajectory_length: int) -> list[int]:
     if normalized == "all_non_last":
         return list(range(max(trajectory_length - 1, 0)))
     return [resolve_step_index(step_spec, trajectory_length)]
+
+
+ODE_REGRESSION_REPRESENTATIVE_STEP = 0
 
 
 def validate_sample(sample: dict[str, Any], stage: str, require_audio: bool) -> None:
@@ -339,25 +364,36 @@ def ensure_parent(path: Path) -> None:
 
 
 def build_latent_payload(
-    video_latent: torch.Tensor,
+    video_latent: torch.Tensor | None,
     fps: float,
     *,
     ode_target_latent: torch.Tensor | None = None,
     ode_sigma: float | None = None,
     ode_step_index: int | None = None,
     ode_clean_step_index: int | None = None,
+    ode_video_trajectory: torch.Tensor | None = None,
+    ode_trajectory_sigmas: torch.Tensor | None = None,
     ode_noise_seeds: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if video_latent.ndim != 4:
-        raise ValueError(f"Expected selected video latent to be 4D [C, F, H, W], got {tuple(video_latent.shape)}")
+    source_video = video_latent
+    if source_video is None:
+        if ode_target_latent is not None:
+            source_video = ode_target_latent
+        elif ode_video_trajectory is not None:
+            source_video = ode_video_trajectory[-1]
+        else:
+            raise ValueError("Video payload requires either video_latent, ode_target_latent, or ode_video_trajectory.")
+    if source_video.ndim != 4:
+        raise ValueError(f"Expected video latent source to be 4D [C, F, H, W], got {tuple(source_video.shape)}")
 
     payload = {
-        "latents": video_latent.cpu().contiguous(),
-        "num_frames": int(video_latent.shape[1]),
-        "height": int(video_latent.shape[2]),
-        "width": int(video_latent.shape[3]),
+        "num_frames": int(source_video.shape[1]),
+        "height": int(source_video.shape[2]),
+        "width": int(source_video.shape[3]),
         "fps": float(fps),
     }
+    if video_latent is not None:
+        payload["latents"] = video_latent.cpu().contiguous()
     if ode_target_latent is not None:
         if ode_target_latent.ndim != 4:
             raise ValueError(
@@ -370,30 +406,53 @@ def build_latent_payload(
         payload["ode_step_index"] = int(ode_step_index)
     if ode_clean_step_index is not None:
         payload["ode_clean_step_index"] = int(ode_clean_step_index)
+    if ode_video_trajectory is not None:
+        if ode_video_trajectory.ndim != 5:
+            raise ValueError(
+                f"Expected ODE video trajectory to be 5D [K, C, F, H, W], got {tuple(ode_video_trajectory.shape)}"
+            )
+        payload["ode_video_trajectory"] = ode_video_trajectory.cpu().contiguous()
+    if ode_trajectory_sigmas is not None:
+        if ode_trajectory_sigmas.ndim != 1:
+            raise ValueError(
+                f"Expected ODE trajectory sigmas to be 1D [K], got {tuple(ode_trajectory_sigmas.shape)}"
+            )
+        payload["ode_trajectory_sigmas"] = ode_trajectory_sigmas.cpu().contiguous()
     if ode_noise_seeds is not None:
         payload["ode_noise_seeds"] = ode_noise_seeds
     return payload
 
 
 def build_audio_payload(
-    audio_latent: torch.Tensor,
+    audio_latent: torch.Tensor | None,
     duration_seconds: float,
     *,
     ode_target_latent: torch.Tensor | None = None,
     ode_sigma: float | None = None,
     ode_step_index: int | None = None,
     ode_clean_step_index: int | None = None,
+    ode_audio_trajectory: torch.Tensor | None = None,
+    ode_trajectory_sigmas: torch.Tensor | None = None,
     ode_noise_seeds: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if audio_latent.ndim != 3:
-        raise ValueError(f"Expected selected audio latent to be 3D [C, T, F], got {tuple(audio_latent.shape)}")
+    source_audio = audio_latent
+    if source_audio is None:
+        if ode_target_latent is not None:
+            source_audio = ode_target_latent
+        elif ode_audio_trajectory is not None:
+            source_audio = ode_audio_trajectory[-1]
+        else:
+            raise ValueError("Audio payload requires either audio_latent, ode_target_latent, or ode_audio_trajectory.")
+    if source_audio.ndim != 3:
+        raise ValueError(f"Expected audio latent source to be 3D [C, T, F], got {tuple(source_audio.shape)}")
 
     payload = {
-        "latents": audio_latent.cpu().contiguous(),
-        "num_time_steps": int(audio_latent.shape[1]),
-        "frequency_bins": int(audio_latent.shape[2]),
+        "num_time_steps": int(source_audio.shape[1]),
+        "frequency_bins": int(source_audio.shape[2]),
         "duration": float(duration_seconds),
     }
+    if audio_latent is not None:
+        payload["latents"] = audio_latent.cpu().contiguous()
     if ode_target_latent is not None:
         if ode_target_latent.ndim != 3:
             raise ValueError(
@@ -406,6 +465,18 @@ def build_audio_payload(
         payload["ode_step_index"] = int(ode_step_index)
     if ode_clean_step_index is not None:
         payload["ode_clean_step_index"] = int(ode_clean_step_index)
+    if ode_audio_trajectory is not None:
+        if ode_audio_trajectory.ndim != 4:
+            raise ValueError(
+                f"Expected ODE audio trajectory to be 4D [K, C, T, F], got {tuple(ode_audio_trajectory.shape)}"
+            )
+        payload["ode_audio_trajectory"] = ode_audio_trajectory.cpu().contiguous()
+    if ode_trajectory_sigmas is not None:
+        if ode_trajectory_sigmas.ndim != 1:
+            raise ValueError(
+                f"Expected ODE trajectory sigmas to be 1D [K], got {tuple(ode_trajectory_sigmas.shape)}"
+            )
+        payload["ode_trajectory_sigmas"] = ode_trajectory_sigmas.cpu().contiguous()
     if ode_noise_seeds is not None:
         payload["ode_noise_seeds"] = ode_noise_seeds
     return payload
@@ -457,7 +528,16 @@ def write_manifest(
     wrote_conditions: bool,
     model_path: Path | None,
     text_encoder_path: Path | None,
+    video_dir_name: str,
+    audio_dir_name: str | None,
 ) -> None:
+    directories: dict[str, str | None] = {
+        video_dir_name: str(precomputed_root / video_dir_name),
+        CONDITIONS_DIR_NAME: str(precomputed_root / CONDITIONS_DIR_NAME) if wrote_conditions else None,
+    }
+    if wrote_audio and audio_dir_name is not None:
+        directories[audio_dir_name] = str(precomputed_root / audio_dir_name)
+
     manifest = {
         "config_path": str(config_path),
         "input_dir": str(input_dir),
@@ -476,11 +556,7 @@ def write_manifest(
         "wrote_conditions": wrote_conditions,
         "model_path": str(model_path) if model_path is not None else None,
         "text_encoder_path": str(text_encoder_path) if text_encoder_path is not None else None,
-        "directories": {
-            "latents": str(precomputed_root / "latents"),
-            "audio_latents": str(precomputed_root / "audio_latents") if wrote_audio else None,
-            "conditions": str(precomputed_root / "conditions") if wrote_conditions else None,
-        },
+        "directories": directories,
     }
 
     ensure_parent(manifest_path)
@@ -522,17 +598,25 @@ def main() -> None:
     if write_conditions and text_encoder_path is None:
         raise ValueError("--text-encoder-path is required when writing conditions.")
 
+    standard_step_spec = args.standard_trajectory_step
+    if args.export_mode == "ode_regression":
+        trajectory_step_label = "full_traj"
+    else:
+        trajectory_step_label = standard_step_spec
+
     output_root = resolve_output_root(
         args.output_dir,
         input_dir,
         args.stage,
-        args.trajectory_step,
+        trajectory_step_label,
         args.export_mode,
     )
     precomputed_root = resolve_precomputed_root(output_root)
-    latents_dir = precomputed_root / "latents"
-    audio_dir = precomputed_root / "audio_latents" if write_audio else None
-    conditions_dir = precomputed_root / "conditions" if write_conditions else None
+    video_dir_name = resolve_video_dir_name(args.export_mode)
+    audio_dir_name = resolve_audio_dir_name(args.export_mode) if write_audio else None
+    latents_dir = precomputed_root / video_dir_name
+    audio_dir = precomputed_root / audio_dir_name if audio_dir_name is not None else None
+    conditions_dir = precomputed_root / CONDITIONS_DIR_NAME if write_conditions else None
 
     input_files = discover_input_files(input_dir, recursive=args.recursive, limit=args.limit)
     if not input_files:
@@ -544,7 +628,7 @@ def main() -> None:
         input_dir,
         args.export_mode,
         args.stage,
-        args.trajectory_step,
+        trajectory_step_label,
     )
 
     text_encoder = None
@@ -567,7 +651,7 @@ def main() -> None:
 
     processed_items = 0
     skipped_items = 0
-    multiple_steps = args.trajectory_step.strip().lower() in {"all", "all_non_last"}
+    multiple_steps = args.export_mode == "standard" and standard_step_spec.strip().lower() in {"all", "all_non_last"}
     warned_zero_sigma = False
 
     try:
@@ -581,7 +665,10 @@ def main() -> None:
             relative_path = input_path.relative_to(input_dir)
             video_traj = sample[f"{args.stage}_video_traj"]
             sigmas = sample[f"{args.stage}_sigmas"]
-            step_indices = resolve_step_indices(args.trajectory_step, video_traj.shape[0])
+            if args.export_mode == "ode_regression":
+                step_indices = [ODE_REGRESSION_REPRESENTATIVE_STEP]
+            else:
+                step_indices = resolve_step_indices(standard_step_spec, video_traj.shape[0])
             clean_video_latent = video_traj[-1]
             noise_seeds = sample.get("noise_seeds")
 
@@ -607,8 +694,8 @@ def main() -> None:
                 selected_sigma = float(sigmas[step_index].item())
                 if args.export_mode == "ode_regression" and selected_sigma <= 0 and not warned_zero_sigma:
                     LOGGER.warning(
-                        "ODE regression export includes sigma<=0 samples. They remain in the dataset but trainer loss "
-                        "will ignore them. Prefer --trajectory-step all_non_last for pure noisy->clean supervision."
+                        "ODE regression export includes sigma<=0 samples. They remain in the dataset and trainer loss "
+                        "will ignore those clean blocks."
                     )
                     warned_zero_sigma = True
 
@@ -624,6 +711,8 @@ def main() -> None:
                         "ode_sigma": selected_sigma,
                         "ode_step_index": step_index,
                         "ode_clean_step_index": video_traj.shape[0] - 1,
+                        "ode_video_trajectory": video_traj,
+                        "ode_trajectory_sigmas": sigmas,
                     }
                     if clean_audio_latent is not None:
                         audio_payload_kwargs = {
@@ -632,12 +721,18 @@ def main() -> None:
                             "ode_sigma": selected_sigma,
                             "ode_step_index": step_index,
                             "ode_clean_step_index": video_traj.shape[0] - 1,
+                            "ode_audio_trajectory": audio_traj,
+                            "ode_trajectory_sigmas": sigmas,
                         }
 
                 if write_latent:
                     ensure_parent(latent_output_path)
                     torch.save(
-                        build_latent_payload(selected_video_latent, fps=fps, **latent_payload_kwargs),
+                        build_latent_payload(
+                            None if args.export_mode == "ode_regression" else selected_video_latent,
+                            fps=fps,
+                            **latent_payload_kwargs,
+                        ),
                         latent_output_path,
                     )
 
@@ -649,7 +744,7 @@ def main() -> None:
                     ensure_parent(audio_output_path)
                     torch.save(
                         build_audio_payload(
-                            selected_audio_latent,
+                            None if args.export_mode == "ode_regression" else selected_audio_latent,
                             duration_seconds,
                             **audio_payload_kwargs,
                         ),
@@ -685,7 +780,7 @@ def main() -> None:
         output_root=output_root,
         precomputed_root=precomputed_root,
         stage=args.stage,
-        trajectory_step=args.trajectory_step,
+        trajectory_step=trajectory_step_label,
         export_mode=args.export_mode,
         fps=fps,
         total_input_files=len(input_files),
@@ -695,6 +790,8 @@ def main() -> None:
         wrote_conditions=write_conditions,
         model_path=model_path,
         text_encoder_path=text_encoder_path,
+        video_dir_name=video_dir_name,
+        audio_dir_name=audio_dir_name,
     )
 
     LOGGER.info(

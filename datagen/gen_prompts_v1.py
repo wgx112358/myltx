@@ -42,6 +42,7 @@ DEFAULT_KEEP_PER_REQUEST = 3
 DEFAULT_TEMPERATURE = 0.78
 DEFAULT_MAX_TOKENS = 3000
 DEFAULT_TIMEOUT = 120
+DEFAULT_REASONING_EFFORT = "low"
 
 MIN_WORDS = 45
 MAX_WORDS = 200
@@ -1755,9 +1756,29 @@ def extract_json(text: str) -> Dict[str, Any]:
     raise ValueError(f"Cannot parse JSON from response: {text[:200]}...")
 
 
+def extract_response_text(payload: Dict[str, Any]) -> str:
+    if isinstance(payload.get("output_text"), str) and payload["output_text"].strip():
+        return payload["output_text"].strip()
+
+    output = payload.get("output", [])
+    collected: List[str] = []
+    for item in output:
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
+                collected.append(content["text"])
+
+    text = "\n".join(part.strip() for part in collected if part.strip()).strip()
+    if text:
+        return text
+
+    raise ValueError(f"Responses API returned no text output: {json.dumps(payload)[:400]}...")
+
+
 def api_call(system: str, user: str, config: RuntimeConfig, temperature: float) -> Dict[str, Any]:
     base = config.api_base.rstrip("/")
-    url = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
+    url = f"{base}/responses" if base.endswith("/v1") else f"{base}/v1/responses"
 
     for attempt in range(5):
         seed = random.randint(0, 2**31 - 1)
@@ -1770,18 +1791,19 @@ def api_call(system: str, user: str, config: RuntimeConfig, temperature: float) 
                 },
                 json={
                     "model": config.model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
+                    "instructions": system,
+                    "input": user,
+                    "reasoning": {
+                        "effort": DEFAULT_REASONING_EFFORT,
+                    },
                     "temperature": temperature,
-                    "max_tokens": config.max_tokens,
+                    "max_output_tokens": config.max_tokens,
                     "seed": seed,
                 },
                 timeout=config.timeout,
             )
             response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"].strip()
+            content = extract_response_text(response.json())
             return extract_json(content)
         except Exception as exc:
             print(f"  Retry {attempt + 1}/5: {exc}")

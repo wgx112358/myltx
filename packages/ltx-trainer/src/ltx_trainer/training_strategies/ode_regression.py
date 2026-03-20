@@ -2,9 +2,9 @@
 
 This strategy consumes precomputed ODE trajectory samples where each sample
 already contains:
-- the current video/audio latent state at a known sigma
+- the full video/audio latent trajectory across denoising steps
 - the clean video/audio target latent
-- the sigma value for that trajectory step
+- the sigma schedule for that trajectory
 
 Because the LTX transformer is a velocity model, the clean target is converted
 to the corresponding velocity target during training:
@@ -29,6 +29,12 @@ except ImportError:
 
 from ltx_core.model.transformer.modality import Modality
 from ltx_trainer import logger
+from ltx_trainer.ode_block_layout import (
+    build_audio_block_ends,
+    build_video_block_ranges,
+    expand_block_values_by_ends,
+    expand_video_block_values,
+)
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
     DEFAULT_FPS,
@@ -43,6 +49,7 @@ class PreparedAudioInputs:
     latents: Tensor
     targets: Tensor
     sigmas: Tensor
+    token_sigmas: Tensor
     timesteps: Tensor
     positions: Tensor
     loss_mask: Tensor
@@ -56,6 +63,17 @@ class BlockCausalMasks:
     audio_to_video: Tensor | BlockMask | None
 
 
+@dataclass(frozen=True)
+class PreparedVideoInputs:
+    latents: Tensor
+    targets: Tensor
+    sigmas: Tensor
+    token_sigmas: Tensor
+    timesteps: Tensor
+    positions: Tensor
+    loss_mask: Tensor
+
+
 class ODERegressionConfig(TrainingStrategyConfigBase):
     """Configuration for ODE regression training."""
 
@@ -66,9 +84,31 @@ class ODERegressionConfig(TrainingStrategyConfigBase):
         description="Whether to include audio supervision in ODE regression training.",
     )
 
-    audio_latents_dir: str = Field(
-        default="audio_latents",
-        description="Directory name for audio latents when with_audio is True.",
+    video_trajectories_dir: str = Field(
+        default="ode_video_trajectories",
+        description="Directory name for ODE video trajectory payloads.",
+    )
+
+    audio_trajectories_dir: str = Field(
+        default="ode_audio_trajectories",
+        description="Directory name for ODE audio trajectory payloads when with_audio is True.",
+    )
+
+    dual_stage_training: bool = Field(
+        default=False,
+        description="Whether to mix stage1 and stage2 ODE batches in a single optimizer step.",
+    )
+
+    stage1_loss_weight: float = Field(
+        default=1.0,
+        description="Weight applied to the stage1 ODE loss during dual-stage training.",
+        ge=0.0,
+    )
+
+    stage2_loss_weight: float = Field(
+        default=1.0,
+        description="Weight applied to the stage2 ODE loss during dual-stage training.",
+        ge=0.0,
     )
 
     sigma_epsilon: float = Field(
@@ -138,6 +178,22 @@ class ODERegressionConfig(TrainingStrategyConfigBase):
         ge=0.0,
     )
 
+    ode_layout_mode: Literal["legacy", "blockwise"] = Field(
+        default="legacy",
+        description="How ODE trajectory supervision is organized.",
+    )
+
+    audio_sink_token_count: int = Field(
+        default=0,
+        description="Number of audio sink tokens to prepend during training.",
+        ge=0,
+    )
+
+    audio_sink_identity_rope: bool = Field(
+        default=False,
+        description="Whether prepended audio sink tokens should use zero positions for identity RoPE.",
+    )
+
 
 class ODERegressionStrategy(TrainingStrategy):
     """ODE regression strategy for precomputed trajectory states."""
@@ -155,12 +211,12 @@ class ODERegressionStrategy(TrainingStrategy):
 
     def get_data_sources(self) -> list[str] | dict[str, str]:
         sources = {
-            "latents": "latents",
+            self.config.video_trajectories_dir: "latents",
             "conditions": "conditions",
         }
 
         if self.config.with_audio:
-            sources[self.config.audio_latents_dir] = "audio_latents"
+            sources[self.config.audio_trajectories_dir] = "audio_latents"
 
         return sources
 
@@ -170,8 +226,14 @@ class ODERegressionStrategy(TrainingStrategy):
         timestep_sampler: TimestepSampler,  # noqa: ARG002 - kept for interface compatibility
     ) -> ModelInputs:
         latents = batch["latents"]
-        video_latents = self._video_patchifier.patchify(latents["latents"])
-        video_targets_x0 = self._video_patchifier.patchify(latents["ode_target_latents"])
+        if self.config.ode_layout_mode != "blockwise":
+            raise ValueError("ODE regression now requires blockwise full-trajectory training; set ode_layout_mode=blockwise.")
+
+        video_trajectory_ref = latents.get("ode_video_trajectory")
+        if video_trajectory_ref is None:
+            raise KeyError('ODE regression now requires "ode_video_trajectory" in latents payload.')
+        if not isinstance(video_trajectory_ref, torch.Tensor):
+            video_trajectory_ref = torch.as_tensor(video_trajectory_ref)
 
         num_frames = int(latents["num_frames"][0].item())
         height = int(latents["height"][0].item())
@@ -186,27 +248,10 @@ class ODERegressionStrategy(TrainingStrategy):
             )
         fps = float(fps_values[0].item()) if fps_values is not None else DEFAULT_FPS
 
-        batch_size = video_latents.shape[0]
-        video_seq_len = video_latents.shape[1]
-        device = video_latents.device
-        dtype = video_latents.dtype
+        batch_size = video_trajectory_ref.shape[0]
+        device = video_trajectory_ref.device
+        dtype = video_trajectory_ref.dtype
 
-        video_sigmas = self._load_sigmas(latents, device=device, dtype=torch.float32)
-        video_model_sigmas = video_sigmas.to(dtype=dtype)
-        video_noise_metadata = self._extract_noise_metadata(latents, batch_size)
-        valid_video_sigma_mask = video_sigmas > self.config.sigma_epsilon
-        if not self._warned_zero_sigma and not torch.all(valid_video_sigma_mask):
-            zero_count = int((~valid_video_sigma_mask).sum().item())
-            logger.warning(
-                "ODE regression batch contains %d sample(s) with sigma <= %.2e; they will be ignored in the loss.",
-                zero_count,
-                self.config.sigma_epsilon,
-            )
-            self._warned_zero_sigma = True
-
-        sigma_denom = video_sigmas.clamp_min(self.config.sigma_epsilon).view(-1, 1, 1)
-        video_targets = (video_latents - video_targets_x0) / sigma_denom
-        video_timesteps = video_model_sigmas.view(-1, 1).expand(-1, video_seq_len)
         video_positions = self._get_video_positions(
             num_frames=num_frames,
             height=height,
@@ -217,6 +262,40 @@ class ODERegressionStrategy(TrainingStrategy):
             dtype=torch.float32,
         )
 
+        video_trajectory = self._load_video_trajectory(latents, device=device, dtype=dtype)
+        video_trajectory_sigmas = self._load_trajectory_sigmas(latents, device=device)
+        block_ranges = self._build_video_block_ranges(num_frames)
+        block_step_indices = self._load_or_sample_block_step_indices(
+            latents=latents,
+            batch_size=batch_size,
+            num_blocks=len(block_ranges),
+            trajectory_length=video_trajectory.shape[1],
+            device=device,
+        )
+        prepared_video = self._prepare_blockwise_video_inputs(
+            latents=latents,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            video_positions=video_positions,
+            video_trajectory=video_trajectory,
+            trajectory_sigmas=video_trajectory_sigmas,
+            block_step_indices=block_step_indices,
+            device=device,
+            dtype=dtype,
+        )
+
+        video_noise_metadata = self._extract_noise_metadata(latents, batch_size)
+        valid_video_sigma_mask = prepared_video.token_sigmas > self.config.sigma_epsilon
+        if not self._warned_zero_sigma and not torch.all(valid_video_sigma_mask.any(dim=1)):
+            zero_count = int((~valid_video_sigma_mask.any(dim=1)).sum().item())
+            logger.warning(
+                "ODE regression batch contains %d sample(s) with sigma <= %.2e; they will be ignored in the loss.",
+                zero_count,
+                self.config.sigma_epsilon,
+            )
+            self._warned_zero_sigma = True
+
         conditions = batch["conditions"]
         video_prompt_embeds = conditions["video_prompt_embeds"]
         prompt_attention_mask = conditions["prompt_attention_mask"]
@@ -225,9 +304,11 @@ class ODERegressionStrategy(TrainingStrategy):
         audio_prompt_embeds = None
         if self.config.with_audio:
             audio_prompt_embeds = conditions["audio_prompt_embeds"]
-            audio_inputs = self._prepare_audio_inputs(
+            audio_inputs = self._prepare_blockwise_audio_inputs(
                 batch=batch,
-                video_sigmas=video_sigmas,
+                video_positions=video_positions,
+                expected_trajectory_sigmas=video_trajectory_sigmas,
+                block_step_indices=block_step_indices,
                 batch_size=batch_size,
                 device=device,
                 dtype=dtype,
@@ -239,7 +320,7 @@ class ODERegressionStrategy(TrainingStrategy):
 
         self._log_noise_metadata_once(
             latents=latents,
-            sigmas=video_sigmas,
+            sigmas=prepared_video.sigmas,
             noise_metadata=video_noise_metadata,
         )
 
@@ -252,20 +333,22 @@ class ODERegressionStrategy(TrainingStrategy):
                 video_positions=video_positions,
                 device=device,
                 audio_positions=audio_inputs.positions if audio_inputs is not None else None,
+                audio_sink_token_count=self.config.audio_sink_token_count,
             )
 
         video_modality = Modality(
             enabled=True,
-            sigma=video_model_sigmas,
-            latent=video_latents,
-            timesteps=video_timesteps,
+            sigma=prepared_video.sigmas,
+            latent=prepared_video.latents,
+            timesteps=prepared_video.timesteps,
             positions=video_positions,
             context=video_prompt_embeds,
             context_mask=prompt_attention_mask,
             attention_mask=causal_masks.video_self if causal_masks is not None else None,
             cross_attention_mask=causal_masks.video_to_audio if causal_masks is not None else None,
+            prompt_sigma=prepared_video.token_sigmas,
         )
-        video_loss_mask = valid_video_sigma_mask.unsqueeze(1).expand(-1, video_seq_len)
+        video_loss_mask = prepared_video.loss_mask
 
         audio_modality = None
         audio_targets = None
@@ -281,6 +364,8 @@ class ODERegressionStrategy(TrainingStrategy):
                 context_mask=prompt_attention_mask,
                 attention_mask=causal_masks.audio_self if causal_masks is not None else None,
                 cross_attention_mask=causal_masks.audio_to_video if causal_masks is not None else None,
+                sink_token_count=self.config.audio_sink_token_count,
+                prompt_sigma=audio_inputs.token_sigmas,
             )
             audio_targets = audio_inputs.targets
             audio_loss_mask = audio_inputs.loss_mask
@@ -288,10 +373,94 @@ class ODERegressionStrategy(TrainingStrategy):
         return ModelInputs(
             video=video_modality,
             audio=audio_modality,
-            video_targets=video_targets,
+            video_targets=prepared_video.targets,
             audio_targets=audio_targets,
             video_loss_mask=video_loss_mask,
             audio_loss_mask=audio_loss_mask,
+        )
+
+    def _prepare_legacy_video_inputs(
+        self,
+        latents: dict[str, Any],
+        num_frames: int,
+        height: int,
+        width: int,
+        fps: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> PreparedVideoInputs:
+        video_latents = self._video_patchifier.patchify(latents["latents"])
+        video_targets_x0 = self._video_patchifier.patchify(latents["ode_target_latents"])
+        video_seq_len = video_latents.shape[1]
+        video_sigmas = self._load_sigmas(latents, device=device, dtype=torch.float32)
+        video_model_sigmas = video_sigmas.to(dtype=dtype)
+        sigma_denom = video_sigmas.clamp_min(self.config.sigma_epsilon).view(-1, 1, 1)
+        video_targets = (video_latents - video_targets_x0) / sigma_denom
+        video_timesteps = video_model_sigmas.view(-1, 1).expand(-1, video_seq_len)
+        video_loss_mask = (video_sigmas > self.config.sigma_epsilon).unsqueeze(1).expand(-1, video_seq_len)
+        video_token_sigmas = video_model_sigmas.view(-1, 1).expand(-1, video_seq_len)
+        video_positions = self._get_video_positions(
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            batch_size=video_latents.shape[0],
+            fps=fps,
+            device=device,
+            dtype=torch.float32,
+        )
+        return PreparedVideoInputs(
+            latents=video_latents,
+            targets=video_targets,
+            sigmas=video_model_sigmas,
+            token_sigmas=video_token_sigmas,
+            timesteps=video_timesteps,
+            positions=video_positions,
+            loss_mask=video_loss_mask,
+        )
+
+    def _prepare_blockwise_video_inputs(
+        self,
+        latents: dict[str, Any],
+        num_frames: int,
+        height: int,
+        width: int,
+        video_positions: Tensor,
+        video_trajectory: Tensor,
+        trajectory_sigmas: Tensor,
+        block_step_indices: Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> PreparedVideoInputs:
+        block_ranges = self._build_video_block_ranges(num_frames)
+
+        mixed_video = torch.empty_like(video_trajectory[:, -1])
+        frame_sigmas = torch.empty((video_trajectory.shape[0], num_frames), device=device, dtype=torch.float32)
+
+        for batch_index in range(video_trajectory.shape[0]):
+            per_block_indices = block_step_indices[batch_index].tolist()
+            per_frame_indices = expand_video_block_values(block_ranges, per_block_indices)
+            per_frame_sigmas = [float(trajectory_sigmas[batch_index, step_index].item()) for step_index in per_frame_indices]
+            frame_sigmas[batch_index] = torch.tensor(per_frame_sigmas, device=device, dtype=torch.float32)
+            for frame_index, step_index in enumerate(per_frame_indices):
+                mixed_video[batch_index, :, frame_index] = video_trajectory[batch_index, step_index, :, frame_index]
+
+        video_latents = self._video_patchifier.patchify(mixed_video)
+        video_targets_x0 = self._video_patchifier.patchify(latents["ode_target_latents"].to(device=device, dtype=dtype))
+        video_token_sigmas = frame_sigmas.unsqueeze(-1).expand(-1, -1, height * width).reshape(video_latents.shape[0], -1)
+        sigma_denom = video_token_sigmas.clamp_min(self.config.sigma_epsilon).unsqueeze(-1)
+        video_targets = (video_latents - video_targets_x0) / sigma_denom
+        video_timesteps = video_token_sigmas.to(dtype=dtype)
+        video_loss_mask = video_token_sigmas > self.config.sigma_epsilon
+        video_model_sigmas = video_token_sigmas.max(dim=1).values.to(dtype=dtype)
+
+        return PreparedVideoInputs(
+            latents=video_latents,
+            targets=video_targets,
+            sigmas=video_model_sigmas,
+            token_sigmas=video_token_sigmas,
+            timesteps=video_timesteps,
+            positions=video_positions,
+            loss_mask=video_loss_mask,
         )
 
     def _prepare_audio_inputs(
@@ -331,13 +500,149 @@ class ODERegressionStrategy(TrainingStrategy):
         )
         audio_loss_mask = (audio_sigmas > self.config.sigma_epsilon).unsqueeze(1).expand(-1, audio_seq_len)
 
-        return PreparedAudioInputs(
+        prepared = PreparedAudioInputs(
             latents=audio_latents,
             targets=audio_targets,
             sigmas=audio_model_sigmas,
+            token_sigmas=audio_model_sigmas.view(-1, 1).expand(-1, audio_seq_len),
             timesteps=audio_timesteps,
             positions=audio_positions,
             loss_mask=audio_loss_mask,
+        )
+        return self._prepend_audio_sink_tokens(prepared)
+
+    def _prepare_blockwise_audio_inputs(
+        self,
+        batch: dict[str, Any],
+        video_positions: Tensor,
+        expected_trajectory_sigmas: Tensor,
+        block_step_indices: Tensor,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> PreparedAudioInputs:
+        audio_data = batch["audio_latents"]
+        audio_trajectory = self._load_audio_trajectory(audio_data, device=device, dtype=dtype)
+        trajectory_sigmas = self._load_trajectory_sigmas(audio_data, device=device)
+        self._validate_blockwise_sigma_match(expected_trajectory_sigmas, trajectory_sigmas)
+        num_frames = int(batch["latents"]["num_frames"][0].item())
+        block_ranges = self._build_video_block_ranges(num_frames)
+        if audio_trajectory.shape[1] != expected_trajectory_sigmas.shape[1]:
+            raise ValueError(
+                "Audio/video trajectory length mismatch detected in blockwise ODE regression. "
+                f"video={expected_trajectory_sigmas.shape[1]}, audio={audio_trajectory.shape[1]}"
+            )
+
+        audio_seq_len = int(audio_data["num_time_steps"][0].item())
+        audio_positions = self._get_audio_positions(
+            num_time_steps=audio_seq_len,
+            batch_size=batch_size,
+            device=device,
+            dtype=torch.float32,
+        )
+        video_frame_end_times = self._get_video_frame_end_times(
+            video_positions=video_positions,
+            video_tokens_per_frame=int(batch["latents"]["height"][0].item() * batch["latents"]["width"][0].item()),
+            num_frames=num_frames,
+        )
+        audio_block_ends = self._build_audio_block_ends(
+            block_ranges=block_ranges,
+            video_frame_end_times=video_frame_end_times,
+            audio_positions=audio_positions,
+            device=device,
+        )
+
+        mixed_audio = torch.empty_like(audio_trajectory[:, -1])
+        token_sigmas = torch.empty((batch_size, audio_seq_len), device=device, dtype=torch.float32)
+
+        for batch_index in range(batch_size):
+            per_block_indices = block_step_indices[batch_index].tolist()
+            per_block_sigmas = [float(trajectory_sigmas[batch_index, step_index].item()) for step_index in per_block_indices]
+            token_sigmas[batch_index] = torch.tensor(
+                expand_block_values_by_ends(
+                    block_ends=audio_block_ends.tolist(),
+                    block_values=per_block_sigmas,
+                    total_len=audio_seq_len,
+                ),
+                device=device,
+                dtype=torch.float32,
+            )
+            prev_end = 0
+            for block_end, step_index in zip(audio_block_ends.tolist(), per_block_indices, strict=True):
+                mixed_audio[batch_index, :, prev_end:block_end] = audio_trajectory[batch_index, step_index, :, prev_end:block_end]
+                prev_end = block_end
+
+        audio_latents = self._audio_patchifier.patchify(mixed_audio)
+        audio_targets_x0 = self._audio_patchifier.patchify(audio_data["ode_target_latents"].to(device=device, dtype=dtype))
+        sigma_denom = token_sigmas.clamp_min(self.config.sigma_epsilon).unsqueeze(-1)
+        audio_targets = (audio_latents - audio_targets_x0) / sigma_denom
+        audio_timesteps = token_sigmas.to(dtype=dtype)
+        audio_loss_mask = token_sigmas > self.config.sigma_epsilon
+        audio_model_sigmas = token_sigmas.max(dim=1).values.to(dtype=dtype)
+
+        prepared = PreparedAudioInputs(
+            latents=audio_latents,
+            targets=audio_targets,
+            sigmas=audio_model_sigmas,
+            token_sigmas=token_sigmas,
+            timesteps=audio_timesteps,
+            positions=audio_positions,
+            loss_mask=audio_loss_mask,
+        )
+        return self._prepend_audio_sink_tokens(prepared)
+
+    def _prepend_audio_sink_tokens(self, audio_inputs: PreparedAudioInputs) -> PreparedAudioInputs:
+        if self.config.audio_sink_token_count == 0:
+            return audio_inputs
+
+        sink_token_count = self.config.audio_sink_token_count
+        batch_size, _, hidden_dim = audio_inputs.latents.shape
+        zero_latents = torch.zeros(
+            batch_size,
+            sink_token_count,
+            hidden_dim,
+            device=audio_inputs.latents.device,
+            dtype=audio_inputs.latents.dtype,
+        )
+        zero_targets = torch.zeros_like(zero_latents)
+        zero_token_sigmas = torch.zeros(
+            batch_size,
+            sink_token_count,
+            device=audio_inputs.token_sigmas.device,
+            dtype=audio_inputs.token_sigmas.dtype,
+        )
+        zero_timesteps = torch.zeros(
+            batch_size,
+            sink_token_count,
+            device=audio_inputs.timesteps.device,
+            dtype=audio_inputs.timesteps.dtype,
+        )
+        zero_loss_mask = torch.zeros(
+            batch_size,
+            sink_token_count,
+            device=audio_inputs.loss_mask.device,
+            dtype=audio_inputs.loss_mask.dtype,
+        )
+        if self.config.audio_sink_identity_rope:
+            sink_positions = torch.zeros(
+                batch_size,
+                audio_inputs.positions.shape[1],
+                sink_token_count,
+                audio_inputs.positions.shape[-1],
+                device=audio_inputs.positions.device,
+                dtype=audio_inputs.positions.dtype,
+            )
+        else:
+            sink_positions = audio_inputs.positions[:, :, :1, :].expand(-1, -1, sink_token_count, -1).clone()
+
+        return PreparedAudioInputs(
+            latents=torch.cat([zero_latents, audio_inputs.latents], dim=1),
+            targets=torch.cat([zero_targets, audio_inputs.targets], dim=1),
+            sigmas=audio_inputs.sigmas,
+            token_sigmas=torch.cat([zero_token_sigmas, audio_inputs.token_sigmas], dim=1),
+            timesteps=torch.cat([zero_timesteps, audio_inputs.timesteps], dim=1),
+            positions=torch.cat([sink_positions, audio_inputs.positions], dim=2),
+            loss_mask=torch.cat([zero_loss_mask, audio_inputs.loss_mask], dim=1),
         )
 
     def compute_loss(
@@ -357,11 +662,9 @@ class ODERegressionStrategy(TrainingStrategy):
             return video_loss
 
         audio_loss = self._masked_mse(audio_pred, inputs.audio_targets, inputs.audio_loss_mask)
-        if self.config.loss_reweight_mode == "auto":
-            scale_ratio = (video_loss / (audio_loss + 1e-8)).detach()
-            return video_loss + audio_loss * scale_ratio
-
-        return self.config.video_loss_weight * video_loss + self.config.audio_loss_weight * audio_loss
+        if self.config.loss_reweight_mode == "manual":
+            return self.config.video_loss_weight * video_loss + self.config.audio_loss_weight * audio_loss
+        return video_loss + audio_loss
 
     def _build_block_causal_masks(
         self,
@@ -371,6 +674,7 @@ class ODERegressionStrategy(TrainingStrategy):
         video_positions: Tensor,
         device: torch.device,
         audio_positions: Tensor | None = None,
+        audio_sink_token_count: int = 0,
     ) -> BlockCausalMasks:
         self._require_block_mask_support()
 
@@ -405,6 +709,11 @@ class ODERegressionStrategy(TrainingStrategy):
             )
 
         audio_seq_len = audio_positions.shape[2]
+        layout_audio_positions = (
+            audio_positions[:, :, audio_sink_token_count:, :]
+            if audio_sink_token_count > 0
+            else audio_positions
+        )
         video_frame_end_times = self._get_video_frame_end_times(
             video_positions=video_positions,
             video_tokens_per_frame=video_tokens_per_frame,
@@ -413,9 +722,11 @@ class ODERegressionStrategy(TrainingStrategy):
         audio_block_ends = self._build_audio_block_ends(
             block_ranges=block_ranges,
             video_frame_end_times=video_frame_end_times,
-            audio_positions=audio_positions,
+            audio_positions=layout_audio_positions,
             device=device,
         )
+        if audio_sink_token_count > 0:
+            audio_block_ends = audio_block_ends + audio_sink_token_count
         avg_audio_tokens_per_block = self._average_audio_tokens_per_block(audio_seq_len, len(block_ranges))
         audio_self_mask = self._create_self_block_mask(
             total_len=audio_seq_len,
@@ -448,21 +759,11 @@ class ODERegressionStrategy(TrainingStrategy):
         )
 
     def _build_video_block_ranges(self, num_frames: int) -> list[tuple[int, int]]:
-        if num_frames <= 0:
-            raise ValueError(f"Expected num_frames > 0, got {num_frames}")
-
-        block_ranges: list[tuple[int, int]] = []
-        next_start = 0
-        if self.config.independent_first_frame:
-            block_ranges.append((0, 0))
-            next_start = 1
-
-        while next_start < num_frames:
-            end = min(next_start + self.config.block_size - 1, num_frames - 1)
-            block_ranges.append((next_start, end))
-            next_start = end + 1
-
-        return block_ranges
+        return build_video_block_ranges(
+            num_frames,
+            block_size=self.config.block_size,
+            independent_first_frame=self.config.independent_first_frame,
+        )
 
     def _build_audio_block_ends(
         self,
@@ -471,28 +772,14 @@ class ODERegressionStrategy(TrainingStrategy):
         audio_positions: Tensor,
         device: torch.device,
     ) -> Tensor:
-        audio_starts = audio_positions[0, 0, :, 0].to(dtype=torch.float32).contiguous()
-        audio_ends = audio_positions[0, 0, :, 1].to(dtype=torch.float32).contiguous()
-        audio_centers = ((audio_starts + audio_ends) / 2.0).contiguous()
-        audio_seq_len = audio_starts.shape[0]
-
-        frame_end_indices = torch.tensor(
-            [frame_end for _, frame_end in block_ranges],
-            device=video_frame_end_times.device,
-            dtype=torch.long,
+        block_ends = build_audio_block_ends(
+            block_ranges=block_ranges,
+            video_frame_end_times=video_frame_end_times.tolist(),
+            audio_starts=audio_positions[0, 0, :, 0].to(dtype=torch.float32).tolist(),
+            audio_ends=audio_positions[0, 0, :, 1].to(dtype=torch.float32).tolist(),
+            audio_boundary_mode=self.config.audio_boundary_mode,
         )
-        boundary_times = video_frame_end_times.index_select(0, frame_end_indices).contiguous()
-
-        if self.config.audio_boundary_mode == "left":
-            block_ends = torch.searchsorted(audio_starts, boundary_times, right=False)
-        elif self.config.audio_boundary_mode == "center":
-            block_ends = torch.searchsorted(audio_centers, boundary_times, right=True)
-        else:
-            block_ends = torch.searchsorted(audio_ends, boundary_times, right=True)
-
-        block_ends = block_ends.clamp_(0, audio_seq_len).to(device=device, dtype=torch.long)
-        block_ends[-1] = audio_seq_len
-        return block_ends
+        return torch.tensor(block_ends, device=device, dtype=torch.long)
 
     def _create_self_block_mask(
         self,
@@ -597,8 +884,52 @@ class ODERegressionStrategy(TrainingStrategy):
 
         loss = (pred - target).pow(2)
         expanded_mask = loss_mask.unsqueeze(-1).to(dtype=loss.dtype)
-        loss = loss.mul(expanded_mask)
-        return loss.sum() / expanded_mask.sum().clamp_min(1.0)
+        return loss.mul(expanded_mask).div(expanded_mask.mean()).mean()
+
+    def _load_or_sample_block_step_indices(
+        self,
+        latents: dict[str, Any],
+        batch_size: int,
+        num_blocks: int,
+        trajectory_length: int,
+        device: torch.device,
+    ) -> Tensor:
+        block_step_indices = latents.get("ode_block_step_indices")
+        if block_step_indices is None:
+            return self._sample_block_step_indices(
+                batch_size=batch_size,
+                num_blocks=num_blocks,
+                trajectory_length=trajectory_length,
+                device=device,
+            )
+        if not isinstance(block_step_indices, torch.Tensor):
+            block_step_indices = torch.as_tensor(block_step_indices)
+        if block_step_indices.ndim == 1:
+            block_step_indices = block_step_indices.unsqueeze(0)
+        return block_step_indices.to(device=device, dtype=torch.long)
+
+    @staticmethod
+    def _sample_block_step_indices(
+        batch_size: int,
+        num_blocks: int,
+        trajectory_length: int,
+        device: torch.device,
+    ) -> Tensor:
+        return torch.randint(0, trajectory_length, (batch_size, num_blocks), device=device, dtype=torch.long)
+
+    def _validate_blockwise_sigma_match(self, video_sigmas: Tensor, audio_sigmas: Tensor) -> None:
+        if not self.config.validate_audio_sigma_match:
+            return
+        if not torch.allclose(
+            video_sigmas,
+            audio_sigmas,
+            atol=self.config.sigma_match_atol,
+            rtol=self.config.sigma_match_rtol,
+        ):
+            raise ValueError(
+                "Audio/video blockwise ode_trajectory_sigmas mismatch detected in ODE regression batch. "
+                f"video={video_sigmas.tolist()}, audio={audio_sigmas.tolist()}"
+            )
 
     @staticmethod
     def _load_sigmas(latents: dict[str, Any], device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -613,6 +944,32 @@ class ODERegressionStrategy(TrainingStrategy):
             sigmas = torch.as_tensor(sigmas)
 
         return sigmas.to(device=device, dtype=dtype).flatten()
+
+    def _use_blockwise_layout(self, latents: dict[str, Any]) -> bool:
+        return self.config.ode_layout_mode == "blockwise" and "ode_video_trajectory" in latents
+
+    @staticmethod
+    def _load_video_trajectory(latents: dict[str, Any], device: torch.device, dtype: torch.dtype) -> Tensor:
+        if "ode_video_trajectory" not in latents:
+            raise KeyError('Blockwise ODE regression requires "ode_video_trajectory" in latents payload.')
+        return latents["ode_video_trajectory"].to(device=device, dtype=dtype)
+
+    @staticmethod
+    def _load_audio_trajectory(latents: dict[str, Any], device: torch.device, dtype: torch.dtype) -> Tensor:
+        if "ode_audio_trajectory" not in latents:
+            raise KeyError('Blockwise ODE regression requires "ode_audio_trajectory" in audio payload.')
+        return latents["ode_audio_trajectory"].to(device=device, dtype=dtype)
+
+    @staticmethod
+    def _load_trajectory_sigmas(latents: dict[str, Any], device: torch.device) -> Tensor:
+        if "ode_trajectory_sigmas" not in latents:
+            raise KeyError('Blockwise ODE regression requires "ode_trajectory_sigmas" in payload.')
+        sigmas = latents["ode_trajectory_sigmas"]
+        if not isinstance(sigmas, torch.Tensor):
+            sigmas = torch.as_tensor(sigmas)
+        if sigmas.ndim == 1:
+            sigmas = sigmas.unsqueeze(0)
+        return sigmas.to(device=device, dtype=torch.float32)
 
     def _log_noise_metadata_once(
         self,

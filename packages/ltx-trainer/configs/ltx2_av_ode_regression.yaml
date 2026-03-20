@@ -5,19 +5,22 @@
 # Use this config together with datasets exported by:
 #   python ode/convert_ode_pt_to_precomputed.py \
 #       --export-mode ode_regression \
-#       --trajectory-step all_non_last
+#       --stage stage1 --output-dir /path/to/ode_dataset_stage1
+#   python ode/convert_ode_pt_to_precomputed.py \
+#       --export-mode ode_regression \
+#       --stage stage2 --output-dir /path/to/ode_dataset_stage2
 #
 # Expected dataset structure:
-#   preprocessed_data_root/
+#   preprocessed_data_root_stage{1,2}/
 #   └── .precomputed/
-#       ├── latents/        # current video latent + ode_target_latents + ode_sigma
-#       ├── conditions/     # text embeddings
-#       └── audio_latents/  # current audio latent + ode_target_latents + ode_sigma
+#       ├── ode_video_trajectories/  # full video trajectory + clean target + sigma schedule
+#       ├── conditions/              # text embeddings
+#       └── ode_audio_trajectories/  # full audio trajectory + clean target + sigma schedule
 
 model:
-  model_path: "path/to/ltx-2-model.safetensors"
-  text_encoder_path: "path/to/gemma-text-encoder"
-  training_mode: "lora"
+  model_path: "/inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/ltx-2.3-22b-distilled.safetensors"
+  text_encoder_path: "/inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/gemma"
+  training_mode: "full"
   load_checkpoint: null
 
 lora:
@@ -33,15 +36,22 @@ lora:
 training_strategy:
   name: "ode_regression"
   with_audio: true
-  audio_latents_dir: "audio_latents"
+  video_trajectories_dir: "ode_video_trajectories"
+  audio_trajectories_dir: "ode_audio_trajectories"
   sigma_epsilon: 1.0e-6
   loss_reweight_mode: "manual"
   video_loss_weight: 1.0
   audio_loss_weight: 1.0
+  dual_stage_training: true
+  stage1_loss_weight: 1.0
+  stage2_loss_weight: 1.0
   use_block_causal_mask: true
   block_size: 6
   independent_first_frame: true
   audio_boundary_mode: "left"
+  ode_layout_mode: "blockwise"
+  audio_sink_token_count: 2
+  audio_sink_identity_rope: true
 
 optimization:
   learning_rate: 1.0e-4
@@ -60,7 +70,8 @@ acceleration:
   load_text_encoder_in_8bit: false
 
 data:
-  preprocessed_data_root: "/inspire/qb-ilm/project/agileapplication/zhangkaipeng-24043/wgx/ode_data/precompute"
+  preprocessed_data_root_stage1: "/inspire/qb-ilm/project/agileapplication/zhangkaipeng-24043/wgx/ode_data/precompute_stage1"
+  preprocessed_data_root_stage2: "/inspire/qb-ilm/project/agileapplication/zhangkaipeng-24043/wgx/ode_data/precompute_stage2"
   num_dataloader_workers: 8
 
 validation:
@@ -103,4 +114,4 @@ wandb:
   log_validation_videos: true
 
 seed: 42
-output_dir: "/inspire/qb-ilm/project/agileapplication/zhangkaipeng-24043/wgx/ode_ckpt"
+output_dir: "/inspire/qb-ilm/project/agileapplication/zhangkaipeng-24043/wgx/ode_ckpt/ltx2_av_ode_regression_full"

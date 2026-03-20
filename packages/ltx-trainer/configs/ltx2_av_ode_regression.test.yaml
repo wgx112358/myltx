@@ -21,11 +21,15 @@ lora:
 training_strategy:
   name: "ode_regression"
   with_audio: true
-  audio_latents_dir: "audio_latents"
+  video_trajectories_dir: "ode_video_trajectories"
+  audio_trajectories_dir: "ode_audio_trajectories"
   sigma_epsilon: 1.0e-6
   loss_reweight_mode: "manual"
   video_loss_weight: 1.0
   audio_loss_weight: 1.0
+  dual_stage_training: true
+  stage1_loss_weight: 1.0
+  stage2_loss_weight: 1.0
 
 optimization:
   learning_rate: 1.0e-4
@@ -44,7 +48,8 @@ acceleration:
   load_text_encoder_in_8bit: false
 
 data:
-  preprocessed_data_root: "/inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data_distilled_stage2_ode_test"
+  preprocessed_data_root_stage1: "/inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data_distilled_stage1_ode_test"
+  preprocessed_data_root_stage2: "/inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data_distilled_stage2_ode_test"
   num_dataloader_workers: 2
 
 validation:

@@ -169,6 +169,7 @@ class LTXModel(torch.nn.Module):
         self.audio_prompt_adaln_single = (
             AdaLayerNormSingle(self.audio_inner_dim, embedding_coefficient=2) if self.cross_attention_adaln else None
         )
+        self.audio_sink_token = torch.nn.Parameter(torch.zeros(1, self.audio_inner_dim))
 
         # Audio output components
         self.audio_scale_shift_table = torch.nn.Parameter(torch.empty(2, self.audio_inner_dim))
@@ -244,6 +245,7 @@ class LTXModel(torch.nn.Module):
                 av_ca_timestep_scale_multiplier=self.av_ca_timestep_scale_multiplier,
                 caption_projection=getattr(self, "audio_caption_projection", None),
                 prompt_adaln=getattr(self, "audio_prompt_adaln_single", None),
+                sink_token_embedding=getattr(self, "audio_sink_token", None),
             )
         elif self.model_type.is_video_enabled():
             self.video_args_preprocessor = TransformerArgsPreprocessor(
@@ -274,6 +276,7 @@ class LTXModel(torch.nn.Module):
                 rope_type=self.rope_type,
                 caption_projection=getattr(self, "audio_caption_projection", None),
                 prompt_adaln=getattr(self, "audio_prompt_adaln_single", None),
+                sink_token_embedding=getattr(self, "audio_sink_token", None),
             )
 
     def _init_transformer_blocks(

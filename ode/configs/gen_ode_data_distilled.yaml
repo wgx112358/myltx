@@ -9,8 +9,8 @@ gemma_root: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/m
 spatial_upsampler_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/model/ltx-2.3-spatial-upscaler-x2-1.0.safetensors
 
 # ── 数据路径 ─────────────────────────────────────────────────────────────────
-caption_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/datagen/ltx_prompts_12000.csv
-output_dir: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data_distilled
+caption_path: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/datagen/ltx_prompts_v1_12000.csv
+output_dir: /inspire/qb-ilm/project/agileapplication/zhangkaipeng-24043/wgx/ode_data/ode_data_raw_v1
 # prompt context 的磁盘缓存目录；为空则默认放到 output_dir 同级目录
 prompt_ctx_cache_dir: /inspire/hdd/project/agileapplication/zhangkaipeng-24043/wgx/myltx/ode/data_distilled_prompt_ctx_cache
 

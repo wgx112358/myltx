@@ -31,6 +31,7 @@ class TransformerArgs:
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
     prompt_timestep: torch.Tensor | None = None
+    prompt_timestep_is_per_query: bool = False
     self_attention_mask: torch.Tensor | BlockMask | None = None
     cross_attention_mask: torch.Tensor | BlockMask | None = None
 
@@ -50,6 +51,7 @@ class TransformerArgsPreprocessor:
         rope_type: LTXRopeType,
         caption_projection: torch.nn.Module | None = None,
         prompt_adaln: AdaLayerNormSingle | None = None,
+        sink_token_embedding: torch.nn.Parameter | None = None,
     ) -> None:
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -63,6 +65,7 @@ class TransformerArgsPreprocessor:
         self.rope_type = rope_type
         self.caption_projection = caption_projection
         self.prompt_adaln = prompt_adaln
+        self.sink_token_embedding = sink_token_embedding
 
     def _prepare_timestep(
         self, timestep: torch.Tensor, adaln: AdaLayerNormSingle, batch_size: int, hidden_dtype: torch.dtype
@@ -155,14 +158,24 @@ class TransformerArgsPreprocessor:
         cross_modality: Modality | None = None,  # noqa: ARG002
     ) -> TransformerArgs:
         x = self.patchify_proj(modality.latent)
+        if modality.sink_token_count > 0 and self.sink_token_embedding is not None:
+            sink_tokens = self.sink_token_embedding.to(device=x.device, dtype=x.dtype).expand(modality.sink_token_count, -1)
+            x = x.clone()
+            x[:, : modality.sink_token_count, :] = sink_tokens.unsqueeze(0).expand(x.shape[0], -1, -1)
         batch_size = x.shape[0]
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, self.adaln, batch_size, modality.latent.dtype
         )
         prompt_timestep = None
+        prompt_timestep_is_per_query = False
         if self.prompt_adaln is not None:
+            prompt_sigma, prompt_timestep_is_per_query = self._resolve_prompt_sigma(
+                modality=modality,
+                batch_size=batch_size,
+                query_len=x.shape[1],
+            )
             prompt_timestep, _ = self._prepare_timestep(
-                modality.sigma, self.prompt_adaln, batch_size, modality.latent.dtype
+                prompt_sigma, self.prompt_adaln, batch_size, modality.latent.dtype
             )
         context = self._prepare_context(modality.context, x)
         attention_mask = self._prepare_attention_mask(modality.context_mask, modality.latent.dtype)
@@ -174,6 +187,13 @@ class TransformerArgsPreprocessor:
             num_attention_heads=self.num_attention_heads,
             x_dtype=modality.latent.dtype,
         )
+        if modality.sink_token_count > 0:
+            cos_freqs, sin_freqs = pe
+            cos_freqs = cos_freqs.clone()
+            sin_freqs = sin_freqs.clone()
+            cos_freqs[:, : modality.sink_token_count, :] = 1
+            sin_freqs[:, : modality.sink_token_count, :] = 0
+            pe = (cos_freqs, sin_freqs)
         self_attention_mask = self._prepare_sequence_attention_mask(modality.attention_mask, modality.latent.dtype)
         cross_attention_mask = self._prepare_sequence_attention_mask(
             modality.cross_attention_mask,
@@ -191,8 +211,40 @@ class TransformerArgsPreprocessor:
             cross_gate_timestep=None,
             enabled=modality.enabled,
             prompt_timestep=prompt_timestep,
+            prompt_timestep_is_per_query=prompt_timestep_is_per_query,
             self_attention_mask=self_attention_mask,
             cross_attention_mask=cross_attention_mask,
+        )
+
+    @staticmethod
+    def _resolve_prompt_sigma(
+        modality: Modality,
+        batch_size: int,
+        query_len: int,
+    ) -> tuple[torch.Tensor, bool]:
+        prompt_sigma = modality.prompt_sigma if modality.prompt_sigma is not None else modality.sigma
+        if prompt_sigma.ndim == 1:
+            if prompt_sigma.shape[0] != batch_size:
+                raise ValueError(
+                    f"Expected prompt sigma batch dimension {batch_size}, got {prompt_sigma.shape[0]}."
+                )
+            return prompt_sigma, False
+        if prompt_sigma.ndim == 2:
+            if prompt_sigma.shape[0] != batch_size:
+                raise ValueError(
+                    f"Expected prompt sigma batch dimension {batch_size}, got {prompt_sigma.shape[0]}."
+                )
+            if prompt_sigma.shape[1] == 1:
+                return prompt_sigma, False
+            if prompt_sigma.shape[1] == query_len:
+                return prompt_sigma, True
+            raise ValueError(
+                "Expected prompt sigma to have shape [B], [B, 1], or [B, query_len]. "
+                f"Got {tuple(prompt_sigma.shape)} for query_len={query_len}."
+            )
+        raise ValueError(
+            "Expected prompt sigma to have rank 1 or 2. "
+            f"Got shape {tuple(prompt_sigma.shape)}."
         )
 
 
@@ -216,6 +268,7 @@ class MultiModalTransformerArgsPreprocessor:
         av_ca_timestep_scale_multiplier: int,
         caption_projection: torch.nn.Module | None = None,
         prompt_adaln: AdaLayerNormSingle | None = None,
+        sink_token_embedding: torch.nn.Parameter | None = None,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
@@ -230,6 +283,7 @@ class MultiModalTransformerArgsPreprocessor:
             rope_type=rope_type,
             caption_projection=caption_projection,
             prompt_adaln=prompt_adaln,
+            sink_token_embedding=sink_token_embedding,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln

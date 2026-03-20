@@ -31,6 +31,7 @@ from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, 
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, LatentState, SpatioTemporalScaleFactors, VideoLatentShape, VideoPixelShape
 from ltx_trainer.progress import SamplingContext
+from ltx_trainer.training_strategies.ode_regression import BlockCausalMasks, ODERegressionConfig, ODERegressionStrategy
 
 if TYPE_CHECKING:
     from ltx_core.model.audio_vae import AudioDecoder, Vocoder
@@ -93,6 +94,13 @@ class GenerationConfig:
     stg_scale: float = 0.0  # STG strength (0.0 = disabled, recommended: 1.0)
     stg_blocks: list[int] | None = None  # Transformer blocks to perturb (None = all, recommended: [29])
     stg_mode: Literal["stg_av", "stg_v"] = "stg_av"  # STG mode: "stg_av" (audio+video) or "stg_v" (video only)
+    use_block_causal_mask: bool = False  # Whether to mirror ODE-regression block-causal attention in validation
+    block_size: int = 6  # Number of latent frames per causal block after the independent first frame
+    independent_first_frame: bool = True  # Whether the first latent frame is its own causal block
+    audio_boundary_mode: Literal["center", "left", "right"] = "left"  # Audio/video boundary assignment rule
+    local_attn_size: int = -1  # Optional local attention window in block units
+    audio_sink_token_count: int = 0  # Number of audio sink tokens to prepend during validation
+    audio_sink_identity_rope: bool = False  # Whether sink tokens should use identity RoPE positions
     # Tiled decoding config: None = use defaults (enabled), False = disable, or TiledDecodingConfig for custom settings
     tiled_decoding: TiledDecodingConfig | Literal[False] | None = None
 
@@ -196,6 +204,8 @@ class ValidationSampler:
         audio_clean_state = (
             audio_tools.create_initial_state(device=device, dtype=torch.bfloat16) if audio_tools else None
         )
+        if audio_clean_state is not None:
+            audio_clean_state = self._prepend_audio_sink_tokens(audio_clean_state, config)
 
         # Apply image conditioning if provided
         if config.condition_image is not None:
@@ -229,6 +239,7 @@ class ValidationSampler:
 
         audio_output = None
         if audio_state is not None and audio_tools is not None:
+            audio_state = self._strip_audio_sink_tokens(audio_state, config.audio_sink_token_count)
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
             audio_output = self._decode_audio(audio_state, device)
@@ -293,6 +304,8 @@ class ValidationSampler:
         audio_clean_state = (
             audio_tools.create_initial_state(device=device, dtype=torch.bfloat16) if audio_tools else None
         )
+        if audio_clean_state is not None:
+            audio_clean_state = self._prepend_audio_sink_tokens(audio_clean_state, config)
         audio_state = noiser(latent_state=audio_clean_state, noise_scale=1.0) if audio_clean_state else None
 
         # Run denoising loop
@@ -325,6 +338,7 @@ class ValidationSampler:
         # Decode audio
         audio_output = None
         if audio_state is not None and audio_tools is not None:
+            audio_state = self._strip_audio_sink_tokens(audio_state, config.audio_sink_token_count)
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
             audio_output = self._decode_audio(audio_state, device)
@@ -497,29 +511,14 @@ class ValidationSampler:
         # Build STG perturbation config if STG is enabled
         stg_perturbation_config = self._build_stg_perturbation_config(config) if stg_guider.enabled() else None
 
-        # Create initial modalities (will be updated each step via replace())
-        video = Modality(
-            enabled=True,
-            latent=video_state.latent,
-            sigma=sigmas[0].repeat(video_state.latent.shape[0]),
-            timesteps=video_state.denoise_mask,
-            positions=video_state.positions,
-            context=v_ctx_pos,
-            context_mask=None,
+        video, audio = self._build_denoising_modalities(
+            config=config,
+            video_state=video_state,
+            audio_state=audio_state,
+            sigma=sigmas[0],
+            v_ctx=v_ctx_pos,
+            a_ctx=a_ctx_pos,
         )
-
-        # Audio modality is None when not generating audio
-        audio: Modality | None = None
-        if audio_state is not None:
-            audio = Modality(
-                enabled=True,
-                latent=audio_state.latent,
-                sigma=sigmas[0].repeat(audio_state.latent.shape[0]),
-                timesteps=audio_state.denoise_mask,
-                positions=audio_state.positions,
-                context=a_ctx_pos,
-                context_mask=None,
-            )
 
         # Wrap transformer with X0Model to convert velocity predictions to denoised outputs
         self._transformer.to(device)
@@ -597,6 +596,151 @@ class ValidationSampler:
                     self._sampling_context.advance_step()
 
         return video_state, audio_state
+
+    def _build_denoising_modalities(
+        self,
+        config: GenerationConfig,
+        video_state: LatentState,
+        audio_state: LatentState | None,
+        sigma: Tensor,
+        v_ctx: Tensor,
+        a_ctx: Tensor,
+    ) -> tuple[Modality, Modality | None]:
+        causal_masks = self._build_block_causal_masks(
+            config=config,
+            video_state=video_state,
+            audio_state=audio_state,
+        )
+
+        video = Modality(
+            enabled=True,
+            latent=video_state.latent,
+            sigma=sigma.repeat(video_state.latent.shape[0]),
+            timesteps=sigma * video_state.denoise_mask,
+            positions=video_state.positions,
+            context=v_ctx,
+            context_mask=None,
+            attention_mask=causal_masks.video_self if causal_masks is not None else None,
+            cross_attention_mask=causal_masks.video_to_audio if causal_masks is not None else None,
+        )
+
+        audio: Modality | None = None
+        if audio_state is not None:
+            audio = Modality(
+                enabled=True,
+                latent=audio_state.latent,
+                sigma=sigma.repeat(audio_state.latent.shape[0]),
+                timesteps=sigma * audio_state.denoise_mask,
+                positions=audio_state.positions,
+                context=a_ctx,
+                context_mask=None,
+                attention_mask=causal_masks.audio_self if causal_masks is not None else None,
+                cross_attention_mask=causal_masks.audio_to_video if causal_masks is not None else None,
+                sink_token_count=config.audio_sink_token_count,
+            )
+
+        return video, audio
+
+    def _build_block_causal_masks(
+        self,
+        config: GenerationConfig,
+        video_state: LatentState,
+        audio_state: LatentState | None,
+    ) -> BlockCausalMasks | None:
+        if not config.use_block_causal_mask:
+            return None
+
+        video_shape = VideoLatentShape.from_pixel_shape(
+            VideoPixelShape(
+                batch=1,
+                frames=config.num_frames,
+                height=config.height,
+                width=config.width,
+                fps=config.frame_rate,
+            )
+        )
+        if video_state.latent.shape[1] != video_shape.token_count():
+            # Reference-video validation prepends extra video tokens; keep the legacy
+            # full-attention path there until we define the correct prefix-aware mask.
+            return None
+
+        strategy = ODERegressionStrategy(
+            ODERegressionConfig(
+                name="ode_regression",
+                with_audio=audio_state is not None,
+                use_block_causal_mask=config.use_block_causal_mask,
+                block_size=config.block_size,
+                independent_first_frame=config.independent_first_frame,
+                audio_boundary_mode=config.audio_boundary_mode,
+                local_attn_size=config.local_attn_size,
+                audio_sink_token_count=config.audio_sink_token_count,
+                audio_sink_identity_rope=config.audio_sink_identity_rope,
+            )
+        )
+        return strategy._build_block_causal_masks(
+            num_frames=video_shape.frames,
+            height=video_shape.height,
+            width=video_shape.width,
+            video_positions=video_state.positions.to(dtype=torch.float32),
+            device=video_state.latent.device,
+            audio_positions=audio_state.positions.to(dtype=torch.float32) if audio_state is not None else None,
+            audio_sink_token_count=config.audio_sink_token_count if audio_state is not None else 0,
+        )
+
+    def _prepend_audio_sink_tokens(self, audio_state: LatentState, config: GenerationConfig) -> LatentState:
+        if config.audio_sink_token_count == 0:
+            return audio_state
+
+        sink_token_count = config.audio_sink_token_count
+        batch_size, _, hidden_dim = audio_state.latent.shape
+        zero_latents = torch.zeros(
+            batch_size,
+            sink_token_count,
+            hidden_dim,
+            device=audio_state.latent.device,
+            dtype=audio_state.latent.dtype,
+        )
+        zero_denoise_mask = torch.zeros(
+            batch_size,
+            sink_token_count,
+            audio_state.denoise_mask.shape[-1],
+            device=audio_state.denoise_mask.device,
+            dtype=audio_state.denoise_mask.dtype,
+        )
+        if config.audio_sink_identity_rope:
+            sink_positions = torch.zeros(
+                batch_size,
+                audio_state.positions.shape[1],
+                sink_token_count,
+                audio_state.positions.shape[-1],
+                device=audio_state.positions.device,
+                dtype=audio_state.positions.dtype,
+            )
+        else:
+            sink_positions = audio_state.positions[:, :, :1, :].expand(-1, -1, sink_token_count, -1).clone()
+
+        return LatentState(
+            latent=torch.cat([zero_latents, audio_state.latent], dim=1),
+            denoise_mask=torch.cat([zero_denoise_mask, audio_state.denoise_mask], dim=1),
+            positions=torch.cat([sink_positions, audio_state.positions], dim=2),
+            clean_latent=torch.cat([zero_latents.clone(), audio_state.clean_latent], dim=1),
+            attention_mask=audio_state.attention_mask,
+        )
+
+    @staticmethod
+    def _strip_audio_sink_tokens(audio_state: LatentState, sink_token_count: int) -> LatentState:
+        if sink_token_count == 0:
+            return audio_state
+
+        return LatentState(
+            latent=audio_state.latent[:, sink_token_count:],
+            denoise_mask=audio_state.denoise_mask[:, sink_token_count:],
+            positions=audio_state.positions[:, :, sink_token_count:],
+            clean_latent=audio_state.clean_latent[:, sink_token_count:],
+            attention_mask=audio_state.attention_mask[:, sink_token_count:, sink_token_count:]
+            if audio_state.attention_mask is not None
+            else None,
+        )
 
     @staticmethod
     def _build_stg_perturbation_config(config: GenerationConfig) -> BatchedPerturbationConfig:

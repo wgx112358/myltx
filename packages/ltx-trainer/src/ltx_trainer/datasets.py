@@ -156,8 +156,12 @@ class PrecomputedDataset(Dataset):
 
     def _discover_samples(self) -> dict[str, list[Path]]:
         """Discover all valid sample files across all data sources."""
-        # Use first data source as the reference to discover samples
-        data_key = "latents" if "latents" in self.data_sources else next(iter(self.data_sources.keys()))
+        # Prefer the source that maps to the canonical video output key so directory renames
+        # do not change how sample discovery is anchored.
+        data_key = next(
+            (dir_name for dir_name, output_key in self.data_sources.items() if output_key == "latents"),
+            next(iter(self.data_sources.keys())),
+        )
         data_path = self.source_paths[data_key]
         data_files = list(data_path.glob("**/*.pt"))
 
@@ -233,9 +237,9 @@ class PrecomputedDataset(Dataset):
 
                 # Normalize latent payloads while preserving backward compatibility.
                 # Video latents use [C, F, H, W] metadata; audio latents use [C, T, F].
-                if dir_name == "audio_latents":
+                if output_key == "audio_latents":
                     data = self._normalize_audio_latents(data)
-                elif "latent" in dir_name.lower():
+                elif output_key == "latents":
                     data = self._normalize_video_latents(data)
 
                 result[output_key] = data
@@ -252,6 +256,9 @@ class PrecomputedDataset(Dataset):
         Normalize video latents to non-patchified format [C, F, H, W].
         Used for keeping backward compatibility with legacy datasets.
         """
+        if "latents" not in data:
+            return data
+
         def _maybe_unpatchify(latent_tensor: Tensor, num_frames: int, height: int, width: int) -> Tensor:
             if latent_tensor.dim() != 2:
                 return latent_tensor
@@ -286,6 +293,8 @@ class PrecomputedDataset(Dataset):
         Normalize audio latents to non-patchified format [C, T, F].
         Used for keeping backward compatibility with legacy datasets.
         """
+        if "latents" not in data:
+            return data
 
         def _maybe_unpatchify(latent_tensor: Tensor, num_time_steps: int, frequency_bins: int) -> Tensor:
             if latent_tensor.dim() != 2:

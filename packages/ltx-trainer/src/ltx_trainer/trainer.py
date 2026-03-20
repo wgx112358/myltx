@@ -40,6 +40,7 @@ from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_strategies import get_training_strategy
+from ltx_trainer.training_strategies.ode_regression import ODERegressionConfig
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
 from ltx_trainer.video_utils import read_video, save_video
@@ -88,6 +89,11 @@ class LtxvTrainer:
         self._load_checkpoint()
         self._prepare_models_for_training()
         self._dataset = None
+        self._dataset_stage1 = None
+        self._dataset_stage2 = None
+        self._dataloader = None
+        self._dataloader_stage1 = None
+        self._dataloader_stage2 = None
         self._global_step = -1
         self._checkpoint_paths = []
         self._loss_ema: float | None = None
@@ -115,7 +121,11 @@ class LtxvTrainer:
 
         self._init_optimizer()
         self._init_dataloader()
-        data_iter = iter(self._dataloader)
+        if self._is_dual_stage_ode_training():
+            data_iter_stage1 = iter(self._dataloader_stage1)
+            data_iter_stage2 = iter(self._dataloader_stage2)
+        else:
+            data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
 
         # Synchronize all processes after initialization
@@ -145,6 +155,8 @@ class LtxvTrainer:
 
         sampled_videos_paths = None
         accumulated_loss = 0.0
+        accumulated_stage1_loss = 0.0
+        accumulated_stage2_loss = 0.0
         accumulation_count = 0
 
         with progress:
@@ -157,12 +169,11 @@ class LtxvTrainer:
             self._accelerator.wait_for_everyone()
 
             for step in range(cfg.optimization.steps * cfg.optimization.gradient_accumulation_steps):
-                # Get next batch, reset the dataloader if needed
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    data_iter = iter(self._dataloader)
-                    batch = next(data_iter)
+                if self._is_dual_stage_ode_training():
+                    batch_stage1, data_iter_stage1 = self._next_batch(data_iter_stage1, self._dataloader_stage1)
+                    batch_stage2, data_iter_stage2 = self._next_batch(data_iter_stage2, self._dataloader_stage2)
+                else:
+                    batch, data_iter = self._next_batch(data_iter, self._dataloader)
 
                 step_start_time = time.time()
                 with self._accelerator.accumulate(self._transformer):
@@ -170,8 +181,14 @@ class LtxvTrainer:
                     if is_optimization_step:
                         self._global_step += 1
 
-                    loss = self._training_step(batch)
-                    loss_scalar = float(loss.detach().item())
+                    if self._is_dual_stage_ode_training():
+                        loss, loss_metrics = self._compute_dual_stage_ode_loss(batch_stage1, batch_stage2)
+                        loss_scalar = loss_metrics["total_loss"]
+                        accumulated_stage1_loss += loss_metrics["stage1_loss"]
+                        accumulated_stage2_loss += loss_metrics["stage2_loss"]
+                    else:
+                        loss = self._training_step(batch)
+                        loss_scalar = float(loss.detach().item())
                     accumulated_loss += loss_scalar
                     accumulation_count += 1
                     self._accelerator.backward(loss)
@@ -229,6 +246,11 @@ class LtxvTrainer:
                     optimizer_step_loss = (
                         accumulated_loss / accumulation_count if accumulation_count > 0 else loss_scalar
                     )
+                    optimizer_stage1_loss = None
+                    optimizer_stage2_loss = None
+                    if self._is_dual_stage_ode_training() and accumulation_count > 0:
+                        optimizer_stage1_loss = accumulated_stage1_loss / accumulation_count
+                        optimizer_stage2_loss = accumulated_stage2_loss / accumulation_count
 
                     progress.update_training(
                         loss=optimizer_step_loss if is_optimization_step else loss_scalar,
@@ -245,6 +267,9 @@ class LtxvTrainer:
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
+                        if optimizer_stage1_loss is not None and optimizer_stage2_loss is not None:
+                            metrics["train/stage1_loss"] = optimizer_stage1_loss
+                            metrics["train/stage2_loss"] = optimizer_stage2_loss
                         if self._config.wandb.log_loss_ema:
                             metrics["train/loss_ema"] = self._update_loss_ema(optimizer_step_loss)
 
@@ -253,6 +278,8 @@ class LtxvTrainer:
 
                     if is_optimization_step:
                         accumulated_loss = 0.0
+                        accumulated_stage1_loss = 0.0
+                        accumulated_stage2_loss = 0.0
                         accumulation_count = 0
 
                     # Fallback logging when progress bars are disabled
@@ -272,9 +299,15 @@ class LtxvTrainer:
                         ema_suffix = ""
                         if self._config.wandb.log_loss_ema and self._loss_ema is not None:
                             ema_suffix = f", Loss EMA: {self._loss_ema:.4f}"
+                        stage_loss_suffix = ""
+                        if optimizer_stage1_loss is not None and optimizer_stage2_loss is not None:
+                            stage_loss_suffix = (
+                                f", Stage1 Loss: {optimizer_stage1_loss:.4f}, "
+                                f"Stage2 Loss: {optimizer_stage2_loss:.4f}"
+                            )
                         logger.info(
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
-                            f"Loss: {optimizer_step_loss:.4f}{ema_suffix}, LR: {current_lr:.2e}, "
+                            f"Loss: {optimizer_step_loss:.4f}{stage_loss_suffix}{ema_suffix}, LR: {current_lr:.2e}, "
                             f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
                         )
 
@@ -292,7 +325,10 @@ class LtxvTrainer:
         total_time_seconds = train_end_time - train_start_time
         steps_per_second = cfg.optimization.steps / total_time_seconds
 
-        samples_per_second = steps_per_second * self._accelerator.num_processes * cfg.optimization.batch_size
+        batch_multiplier = 2 if self._is_dual_stage_ode_training() else 1
+        samples_per_second = (
+            steps_per_second * self._accelerator.num_processes * cfg.optimization.batch_size * batch_multiplier
+        )
 
         stats = TrainingStats(
             total_time_seconds=total_time_seconds,
@@ -300,7 +336,7 @@ class LtxvTrainer:
             samples_per_second=samples_per_second,
             peak_gpu_memory_gb=peak_mem,
             num_processes=self._accelerator.num_processes,
-            global_batch_size=cfg.optimization.batch_size * self._accelerator.num_processes,
+            global_batch_size=cfg.optimization.batch_size * self._accelerator.num_processes * batch_multiplier,
         )
 
         saved_path = self._save_checkpoint()
@@ -369,6 +405,40 @@ class LtxvTrainer:
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
 
         return loss
+
+    def _is_dual_stage_ode_training(self) -> bool:
+        """Return whether this run mixes stage1 and stage2 ODE batches."""
+        return isinstance(self._config.training_strategy, ODERegressionConfig) and bool(
+            self._config.training_strategy.dual_stage_training
+        )
+
+    def _compute_dual_stage_ode_loss(
+        self,
+        batch_stage1: dict[str, dict[str, Tensor]],
+        batch_stage2: dict[str, dict[str, Tensor]],
+    ) -> tuple[Tensor, dict[str, float]]:
+        """Compute weighted stage1 and stage2 ODE losses for one micro-step."""
+        strategy_config = self._config.training_strategy
+        if not isinstance(strategy_config, ODERegressionConfig) or not strategy_config.dual_stage_training:
+            raise ValueError("_compute_dual_stage_ode_loss requires dual-stage ODE regression training.")
+
+        stage1_loss = self._training_step(batch_stage1)
+        stage2_loss = self._training_step(batch_stage2)
+        total_loss = strategy_config.stage1_loss_weight * stage1_loss + strategy_config.stage2_loss_weight * stage2_loss
+        return total_loss, {
+            "stage1_loss": float(stage1_loss.detach().item()),
+            "stage2_loss": float(stage2_loss.detach().item()),
+            "total_loss": float(total_loss.detach().item()),
+        }
+
+    @staticmethod
+    def _next_batch(data_iter, dataloader):
+        """Fetch the next batch, restarting the iterator when needed."""
+        try:
+            return next(data_iter), data_iter
+        except StopIteration:
+            data_iter = iter(dataloader)
+            return next(data_iter), data_iter
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
@@ -626,16 +696,44 @@ class LtxvTrainer:
 
     def _init_dataloader(self) -> None:
         """Initialize the training data loader using the strategy's data sources."""
-        if self._dataset is None:
-            # Get data sources from the training strategy
-            data_sources = self._training_strategy.get_data_sources()
+        data_sources = self._training_strategy.get_data_sources()
+        if self._is_dual_stage_ode_training():
+            if self._dataset_stage1 is None:
+                self._dataset_stage1 = PrecomputedDataset(
+                    self._config.data.preprocessed_data_root_stage1,
+                    data_sources=data_sources,
+                )
+                logger.debug(
+                    "Loaded stage1 dataset with %d samples from sources: %s",
+                    len(self._dataset_stage1),
+                    list(data_sources),
+                )
+            if self._dataset_stage2 is None:
+                self._dataset_stage2 = PrecomputedDataset(
+                    self._config.data.preprocessed_data_root_stage2,
+                    data_sources=data_sources,
+                )
+                logger.debug(
+                    "Loaded stage2 dataset with %d samples from sources: %s",
+                    len(self._dataset_stage2),
+                    list(data_sources),
+                )
 
+            self._dataloader_stage1 = self._accelerator.prepare(self._build_dataloader(self._dataset_stage1))
+            self._dataloader_stage2 = self._accelerator.prepare(self._build_dataloader(self._dataset_stage2))
+            return
+
+        if self._dataset is None:
             self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
+        self._dataloader = self._accelerator.prepare(self._build_dataloader(self._dataset))
+
+    def _build_dataloader(self, dataset: PrecomputedDataset) -> DataLoader:
+        """Construct a dataloader for a precomputed dataset."""
         num_workers = self._config.data.num_dataloader_workers
-        dataloader = DataLoader(
-            self._dataset,
+        return DataLoader(
+            dataset,
             batch_size=self._config.optimization.batch_size,
             shuffle=True,
             drop_last=True,
@@ -643,8 +741,6 @@ class LtxvTrainer:
             pin_memory=num_workers > 0,
             persistent_workers=num_workers > 0,
         )
-
-        self._dataloader = self._accelerator.prepare(dataloader)
 
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""
@@ -831,6 +927,17 @@ class LtxvTrainer:
             )
 
             # Create generation config
+            ode_validation_kwargs = {}
+            if isinstance(self._config.training_strategy, ODERegressionConfig):
+                ode_validation_kwargs = {
+                    "use_block_causal_mask": self._config.training_strategy.use_block_causal_mask,
+                    "block_size": self._config.training_strategy.block_size,
+                    "independent_first_frame": self._config.training_strategy.independent_first_frame,
+                    "audio_boundary_mode": self._config.training_strategy.audio_boundary_mode,
+                    "local_attn_size": self._config.training_strategy.local_attn_size,
+                    "audio_sink_token_count": self._config.training_strategy.audio_sink_token_count,
+                    "audio_sink_identity_rope": self._config.training_strategy.audio_sink_identity_rope,
+                }
             gen_config = GenerationConfig(
                 prompt=prompt,
                 negative_prompt=self._config.validation.negative_prompt,
@@ -850,6 +957,7 @@ class LtxvTrainer:
                 stg_scale=self._config.validation.stg_scale,
                 stg_blocks=self._config.validation.stg_blocks,
                 stg_mode=self._config.validation.stg_mode,
+                **ode_validation_kwargs,
             )
 
             # Generate sample

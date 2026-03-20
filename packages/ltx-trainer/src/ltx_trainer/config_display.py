@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ltx_trainer.config import LtxTrainerConfig
+from ltx_trainer.training_strategies.ode_regression import ODERegressionConfig
 
 
 def print_config(config: LtxTrainerConfig) -> None:
@@ -29,6 +30,13 @@ def print_config(config: LtxTrainerConfig) -> None:
     opt = cfg.optimization
     val = cfg.validation
     accel = cfg.acceleration
+    if isinstance(cfg.training_strategy, ODERegressionConfig) and cfg.training_strategy.dual_stage_training:
+        data_items = [
+            ("Stage1 Dataset", fmt(cfg.data.preprocessed_data_root_stage1)),
+            ("Stage2 Dataset", fmt(cfg.data.preprocessed_data_root_stage2)),
+        ]
+    else:
+        data_items = [("Dataset", fmt(cfg.data.preprocessed_data_root))]
 
     # Build sections: list of (section_title, [(key, value), ...])
     sections: list[tuple[str, list[tuple[str, str]]]] = [
@@ -107,8 +115,8 @@ def print_config(config: LtxTrainerConfig) -> None:
             ),
             (
                 "📂 Data & Output",
-                [
-                    ("Dataset", fmt(cfg.data.preprocessed_data_root)),
+                data_items
+                + [
                     ("Dataloader Workers", str(cfg.data.num_dataloader_workers)),
                     ("Output Dir", fmt(cfg.output_dir)),
                     ("Seed", str(cfg.seed)),
