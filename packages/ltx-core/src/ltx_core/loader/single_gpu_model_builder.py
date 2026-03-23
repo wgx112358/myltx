@@ -22,6 +22,76 @@ from ltx_core.model.model_protocol import ModelConfigurator, ModelType
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def _resolve_module_attr(root_module: torch.nn.Module, qualified_name: str) -> tuple[torch.nn.Module, str]:
+    module = root_module
+    name_parts = qualified_name.split(".")
+    for part in name_parts[:-1]:
+        module = module[int(part)] if part.isdigit() else getattr(module, part)
+    return module, name_parts[-1]
+
+
+def _replace_object_references(root: object, old_obj: object, new_obj: object, seen: set[int] | None = None) -> None:
+    if seen is None:
+        seen = set()
+
+    root_id = id(root)
+    if root_id in seen:
+        return
+    seen.add(root_id)
+
+    if isinstance(root, dict):
+        for key, value in list(root.items()):
+            if value is old_obj:
+                root[key] = new_obj
+            elif hasattr(value, "__dict__") or isinstance(value, (dict, list)):
+                _replace_object_references(value, old_obj, new_obj, seen)
+        return
+
+    if isinstance(root, list):
+        for index, value in enumerate(list(root)):
+            if value is old_obj:
+                root[index] = new_obj
+            elif hasattr(value, "__dict__") or isinstance(value, (dict, list)):
+                _replace_object_references(value, old_obj, new_obj, seen)
+        return
+
+    if not hasattr(root, "__dict__"):
+        return
+
+    for attr_name, value in vars(root).items():
+        if value is old_obj:
+            setattr(root, attr_name, new_obj)
+        elif hasattr(value, "__dict__") or isinstance(value, (dict, list)):
+            _replace_object_references(value, old_obj, new_obj, seen)
+
+
+def _materialize_meta_tensors(model: torch.nn.Module, device: torch.device) -> list[str]:
+    materialized: list[str] = []
+
+    for name, param in list(model.named_parameters()):
+        if str(param.device) != "meta":
+            continue
+        parent_module, attr_name = _resolve_module_attr(model, name)
+        replacement = torch.nn.Parameter(
+            torch.zeros(param.shape, device=device, dtype=param.dtype),
+            requires_grad=param.requires_grad,
+        )
+        parent_module._parameters[attr_name] = replacement
+        _replace_object_references(model, param, replacement)
+        materialized.append(name)
+
+    for name, buffer in list(model.named_buffers()):
+        if str(buffer.device) != "meta":
+            continue
+        parent_module, attr_name = _resolve_module_attr(model, name)
+        replacement = torch.zeros(buffer.shape, device=device, dtype=buffer.dtype)
+        parent_module._buffers[attr_name] = replacement
+        _replace_object_references(model, buffer, replacement)
+        materialized.append(name)
+
+    return materialized
+
+
 @dataclass(frozen=True)
 class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType], LoRAAdaptableProtocol):
     """
@@ -78,7 +148,13 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         uninitialized_params = [name for name, param in meta_model.named_parameters() if str(param.device) == "meta"]
         uninitialized_buffers = [name for name, buffer in meta_model.named_buffers() if str(buffer.device) == "meta"]
         if uninitialized_params or uninitialized_buffers:
-            logger.warning(f"Uninitialized parameters or buffers: {uninitialized_params + uninitialized_buffers}")
+            uninitialized = uninitialized_params + uninitialized_buffers
+            logger.warning(
+                "Uninitialized parameters or buffers: %s; materializing them with zeros on %s",
+                uninitialized,
+                device,
+            )
+            _materialize_meta_tensors(meta_model, device)
             return meta_model
         retval = meta_model.to(device)
         return retval

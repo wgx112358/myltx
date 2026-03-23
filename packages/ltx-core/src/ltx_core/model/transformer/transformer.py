@@ -6,9 +6,12 @@ from ltx_core.guidance.perturbations import BatchedPerturbationConfig, Perturbat
 from ltx_core.model.transformer.adaln import adaln_embedding_coefficient
 from ltx_core.model.transformer.attention import Attention, AttentionCallable, AttentionFunction
 from ltx_core.model.transformer.feed_forward import FeedForward
+from ltx_core.model.transformer.modality import CrossAttentionChunkPlan
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer_args import TransformerArgs
 from ltx_core.utils import rms_norm
+
+PROMPT_QUERY_CHUNK_SIZE = 256
 
 
 @dataclass
@@ -19,6 +22,157 @@ class TransformerConfig:
     context_dim: int
     apply_gated_attention: bool = False
     cross_attention_adaln: bool = False
+
+
+def apply_checkpointed_feed_forward(
+    ff: torch.nn.Module,
+    x: torch.Tensor,
+    checkpoint_ff: bool = False,
+) -> torch.Tensor:
+    if checkpoint_ff and torch.is_grad_enabled() and x.requires_grad:
+        return torch.utils.checkpoint.checkpoint(ff, x, use_reentrant=False)
+    return ff(x)
+
+
+def _slice_rope(
+    pe: tuple[torch.Tensor, torch.Tensor] | None,
+    start: int,
+    end: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if pe is None:
+        return None
+    cos_freqs, sin_freqs = pe
+    if cos_freqs.ndim == 3:
+        return cos_freqs[:, start:end], sin_freqs[:, start:end]
+    if cos_freqs.ndim == 4:
+        return cos_freqs[:, :, start:end], sin_freqs[:, :, start:end]
+    raise ValueError(f'Unsupported RoPE rank {cos_freqs.ndim}; expected 3 or 4 dimensions.')
+
+
+def apply_chunked_cross_attention(
+    x: torch.Tensor,
+    context: torch.Tensor,
+    attn: AttentionCallable,
+    chunk_plan: CrossAttentionChunkPlan | None,
+    mask: object | None = None,
+    pe: tuple[torch.Tensor, torch.Tensor] | None = None,
+    k_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
+    checkpoint_chunks: bool = False,
+) -> torch.Tensor:
+    if chunk_plan is None:
+        return attn(x, context=context, mask=mask, pe=pe, k_pe=k_pe)
+
+    block_ends = chunk_plan.query_block_ends.tolist()
+    target_starts = chunk_plan.target_starts.tolist()
+    target_ends = chunk_plan.target_ends.tolist()
+    if len(block_ends) != len(target_starts) or len(block_ends) != len(target_ends):
+        raise ValueError('Cross-attention chunk plan must provide aligned query and target ranges.')
+
+    projected_context: tuple[torch.Tensor, torch.Tensor] | None = None
+    if isinstance(attn, Attention):
+        projected_context = attn.project_context(context, k_pe=k_pe)
+
+    output = torch.empty_like(x)
+    query_start = 0
+    for query_end, target_start, target_end in zip(block_ends, target_starts, target_ends, strict=True):
+        if query_end < query_start:
+            raise ValueError('Cross-attention chunk plan query block ends must be non-decreasing.')
+        if target_start < 0 or target_end < target_start or target_end > context.shape[1]:
+            raise ValueError(
+                'Cross-attention chunk plan target range is out of bounds. '
+                f'Got [{target_start}, {target_end}) for context length {context.shape[1]}.'
+            )
+        if query_end == query_start:
+            continue
+
+        query_chunk = x[:, query_start:query_end]
+        pe_chunk = _slice_rope(pe, query_start, query_end)
+
+        if projected_context is not None:
+            projected_k, projected_v = projected_context
+            key_chunk = projected_k[:, target_start:target_end]
+            value_chunk = projected_v[:, target_start:target_end]
+
+            if checkpoint_chunks and torch.is_grad_enabled() and (
+                query_chunk.requires_grad or key_chunk.requires_grad or value_chunk.requires_grad
+            ):
+                current_pe_chunk = pe_chunk
+
+                def run_attn(
+                    query_slice: torch.Tensor,
+                    key_slice: torch.Tensor,
+                    value_slice: torch.Tensor,
+                    current_pe_chunk: tuple[torch.Tensor, torch.Tensor] | None = current_pe_chunk,
+                ) -> torch.Tensor:
+                    return attn.forward_with_preprojected_context(
+                        query_slice,
+                        projected_k=key_slice,
+                        projected_v=value_slice,
+                        mask=None,
+                        pe=current_pe_chunk,
+                    )
+
+                chunk_output = torch.utils.checkpoint.checkpoint(
+                    run_attn,
+                    query_chunk,
+                    key_chunk,
+                    value_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                chunk_output = attn.forward_with_preprojected_context(
+                    query_chunk,
+                    projected_k=key_chunk,
+                    projected_v=value_chunk,
+                    mask=None,
+                    pe=pe_chunk,
+                )
+        else:
+            context_chunk = context[:, target_start:target_end]
+            k_pe_chunk = _slice_rope(k_pe, target_start, target_end)
+
+            if checkpoint_chunks and torch.is_grad_enabled() and (
+                query_chunk.requires_grad or context_chunk.requires_grad
+            ):
+                current_pe_chunk = pe_chunk
+                current_k_pe_chunk = k_pe_chunk
+
+                def run_attn(
+                    query_slice: torch.Tensor,
+                    context_slice: torch.Tensor,
+                    current_pe_chunk: tuple[torch.Tensor, torch.Tensor] | None = current_pe_chunk,
+                    current_k_pe_chunk: tuple[torch.Tensor, torch.Tensor] | None = current_k_pe_chunk,
+                ) -> torch.Tensor:
+                    return attn(
+                        query_slice,
+                        context=context_slice,
+                        mask=None,
+                        pe=current_pe_chunk,
+                        k_pe=current_k_pe_chunk,
+                    )
+
+                chunk_output = torch.utils.checkpoint.checkpoint(
+                    run_attn,
+                    query_chunk,
+                    context_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                chunk_output = attn(
+                    query_chunk,
+                    context=context_chunk,
+                    mask=None,
+                    pe=pe_chunk,
+                    k_pe=k_pe_chunk,
+                )
+
+        output[:, query_start:query_end] = chunk_output
+        query_start = query_end
+
+    if query_start != x.shape[1]:
+        raise ValueError(f'Cross-attention chunk plan covered {query_start} query tokens, expected {x.shape[1]}.')
+
+    return output
 
 
 class BasicAVTransformerBlock(torch.nn.Module):
@@ -165,6 +319,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         timestep: torch.Tensor,
         prompt_timestep: torch.Tensor | None,
         prompt_timestep_is_per_query: bool,
+        prompt_timestep_run_lengths: torch.Tensor | None,
         context_mask: torch.Tensor | None,
         cross_attention_adaln: bool = False,
     ) -> torch.Tensor:
@@ -181,6 +336,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 prompt_scale_shift_table,
                 prompt_timestep,
                 prompt_timestep_is_per_query,
+                prompt_timestep_run_lengths,
                 context_mask,
                 self.norm_eps,
             )
@@ -244,6 +400,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 video.timesteps,
                 video.prompt_timestep,
                 video.prompt_timestep_is_per_query,
+                video.prompt_timestep_run_lengths,
                 video.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
             )
@@ -283,43 +440,47 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 audio.timesteps,
                 audio.prompt_timestep,
                 audio.prompt_timestep_is_per_query,
+                audio.prompt_timestep_run_lengths,
                 audio.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
             )
 
         # Audio - Video cross attention.
         if run_a2v or run_v2a:
-            vx_norm3 = rms_norm(vx, eps=self.norm_eps)
-            ax_norm3 = rms_norm(ax, eps=self.norm_eps)
+            vx_cross_input = vx
+            ax_cross_input = ax
 
             if run_a2v and not perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx):
                 scale_ca_video_a2v, shift_ca_video_a2v, gate_out_a2v = self.get_av_ca_ada_values(
                     self.scale_shift_table_a2v_ca_video,
-                    vx.shape[0],
+                    vx_cross_input.shape[0],
                     video.cross_scale_shift_timestep,
                     video.cross_gate_timestep,
                     slice(0, 2),
                 )
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
+                vx_scaled = rms_norm(vx_cross_input, eps=self.norm_eps) * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
                 del scale_ca_video_a2v, shift_ca_video_a2v
 
                 scale_ca_audio_a2v, shift_ca_audio_a2v, _ = self.get_av_ca_ada_values(
                     self.scale_shift_table_a2v_ca_audio,
-                    ax.shape[0],
+                    ax_cross_input.shape[0],
                     audio.cross_scale_shift_timestep,
                     audio.cross_gate_timestep,
                     slice(0, 2),
                 )
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
+                ax_scaled = rms_norm(ax_cross_input, eps=self.norm_eps) * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
                 del scale_ca_audio_a2v, shift_ca_audio_a2v
                 a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
                 vx = vx + (
-                    self.audio_to_video_attn(
+                    apply_chunked_cross_attention(
                         vx_scaled,
                         context=ax_scaled,
+                        attn=self.audio_to_video_attn,
+                        chunk_plan=video.cross_attention_chunk_plan,
                         mask=video.cross_attention_mask,
                         pe=video.cross_positional_embeddings,
                         k_pe=audio.cross_positional_embeddings,
+                        checkpoint_chunks=self.training,
                     )
                     * gate_out_a2v
                     * a2v_mask
@@ -329,44 +490,45 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if run_v2a and not perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx):
                 scale_ca_audio_v2a, shift_ca_audio_v2a, gate_out_v2a = self.get_av_ca_ada_values(
                     self.scale_shift_table_a2v_ca_audio,
-                    ax.shape[0],
+                    ax_cross_input.shape[0],
                     audio.cross_scale_shift_timestep,
                     audio.cross_gate_timestep,
                     slice(2, 4),
                 )
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
+                ax_scaled = rms_norm(ax_cross_input, eps=self.norm_eps) * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
                 del scale_ca_audio_v2a, shift_ca_audio_v2a
                 scale_ca_video_v2a, shift_ca_video_v2a, _ = self.get_av_ca_ada_values(
                     self.scale_shift_table_a2v_ca_video,
-                    vx.shape[0],
+                    vx_cross_input.shape[0],
                     video.cross_scale_shift_timestep,
                     video.cross_gate_timestep,
                     slice(2, 4),
                 )
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
+                vx_scaled = rms_norm(vx_cross_input, eps=self.norm_eps) * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
                 del scale_ca_video_v2a, shift_ca_video_v2a
                 v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
                 ax = ax + (
-                    self.video_to_audio_attn(
+                    apply_chunked_cross_attention(
                         ax_scaled,
                         context=vx_scaled,
+                        attn=self.video_to_audio_attn,
+                        chunk_plan=audio.cross_attention_chunk_plan,
                         mask=audio.cross_attention_mask,
                         pe=audio.cross_positional_embeddings,
                         k_pe=video.cross_positional_embeddings,
+                        checkpoint_chunks=self.training,
                     )
                     * gate_out_v2a
                     * v2a_mask
                 )
                 del gate_out_v2a, v2a_mask, ax_scaled, vx_scaled
 
-            del vx_norm3, ax_norm3
-
         if run_vx:
             vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
             )
             vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
-            vx = vx + self.ff(vx_scaled) * vgate_mlp
+            vx = vx + apply_checkpointed_feed_forward(self.ff, vx_scaled, checkpoint_ff=self.training) * vgate_mlp
 
             del vshift_mlp, vscale_mlp, vgate_mlp, vx_scaled
 
@@ -375,7 +537,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
             )
             ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
-            ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            ax = ax + apply_checkpointed_feed_forward(self.audio_ff, ax_scaled, checkpoint_ff=self.training) * agate_mlp
 
             del ashift_mlp, ascale_mlp, agate_mlp, ax_scaled
 
@@ -392,12 +554,89 @@ def apply_cross_attention_adaln(
     prompt_scale_shift_table: torch.Tensor,
     prompt_timestep: torch.Tensor,
     prompt_timestep_is_per_query: bool,
+    prompt_timestep_run_lengths: torch.Tensor | None = None,
     context_mask: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> torch.Tensor:
     batch_size = x.shape[0]
     attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale) + q_shift
     prompt_scale_shift = prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
+
+    def apply_prompt_run(
+        query_slice: torch.Tensor,
+        conditioned_context: torch.Tensor,
+        query_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if isinstance(attn, Attention):
+            chunk_outputs: list[torch.Tensor] = []
+            for chunk_start in range(0, query_slice.shape[1], PROMPT_QUERY_CHUNK_SIZE):
+                chunk_end = min(chunk_start + PROMPT_QUERY_CHUNK_SIZE, query_slice.shape[1])
+                query_chunk = query_slice[:, chunk_start:chunk_end]
+                mask_chunk = None
+                if query_mask is not None:
+                    mask_chunk = query_mask[:, :, chunk_start:chunk_end, :]
+
+                if torch.is_grad_enabled() and (
+                    query_chunk.requires_grad or conditioned_context.requires_grad
+                ):
+                    if mask_chunk is not None:
+                        def run_prompt_chunk(
+                            query_chunk_input: torch.Tensor,
+                            context_input: torch.Tensor,
+                            mask_input: torch.Tensor,
+                        ) -> torch.Tensor:
+                            projected_k, projected_v = attn.project_context(context_input)
+                            return attn.forward_with_preprojected_context(
+                                query_chunk_input,
+                                projected_k=projected_k,
+                                projected_v=projected_v,
+                                mask=mask_input,
+                            )
+
+                        chunk_outputs.append(
+                            torch.utils.checkpoint.checkpoint(
+                                run_prompt_chunk,
+                                query_chunk,
+                                conditioned_context,
+                                mask_chunk,
+                                use_reentrant=False,
+                            )
+                        )
+                    else:
+                        def run_prompt_chunk(
+                            query_chunk_input: torch.Tensor,
+                            context_input: torch.Tensor,
+                        ) -> torch.Tensor:
+                            projected_k, projected_v = attn.project_context(context_input)
+                            return attn.forward_with_preprojected_context(
+                                query_chunk_input,
+                                projected_k=projected_k,
+                                projected_v=projected_v,
+                                mask=None,
+                            )
+
+                        chunk_outputs.append(
+                            torch.utils.checkpoint.checkpoint(
+                                run_prompt_chunk,
+                                query_chunk,
+                                conditioned_context,
+                                use_reentrant=False,
+                            )
+                        )
+                    continue
+
+                projected_k, projected_v = attn.project_context(conditioned_context)
+                chunk_outputs.append(
+                    attn.forward_with_preprojected_context(
+                        query_chunk,
+                        projected_k=projected_k,
+                        projected_v=projected_v,
+                        mask=mask_chunk,
+                    )
+                )
+            return torch.cat(chunk_outputs, dim=1)
+
+        return attn(query_slice, context=conditioned_context, mask=query_mask)
 
     if not prompt_timestep_is_per_query:
         shift_kv, scale_kv = (
@@ -409,19 +648,57 @@ def apply_cross_attention_adaln(
                 f"Got prompt length {scale_kv.shape[1]} for context length {context.shape[1]}."
             )
         encoder_hidden_states = context * (1 + scale_kv) + shift_kv
-        return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
+        return apply_prompt_run(attn_input, encoder_hidden_states, context_mask) * q_gate
 
     query_len = attn_input.shape[1]
-    if prompt_timestep.shape[1] != query_len:
-        raise ValueError(
-            "Per-query prompt conditioning requires one prompt timestep per query token. "
-            f"Got prompt length {prompt_timestep.shape[1]} for query length {query_len}."
-        )
-
     output = torch.empty_like(attn_input)
+
     for batch_index in range(batch_size):
-        sample_prompt_timestep = prompt_timestep[batch_index]
         run_start = 0
+        if prompt_timestep_run_lengths is not None:
+            sample_prompt_timestep = prompt_timestep[batch_index]
+            for run_index, run_length_tensor in enumerate(prompt_timestep_run_lengths[batch_index]):
+                run_length = int(run_length_tensor.item())
+                if run_length <= 0:
+                    break
+
+                run_end = run_start + run_length
+                if run_end > query_len:
+                    raise ValueError(
+                        'Per-query prompt conditioning run lengths exceed the query length. '
+                        f'Got run_end={run_end} for query length {query_len}.'
+                    )
+
+                shift_kv, scale_kv = (
+                    prompt_scale_shift + sample_prompt_timestep[run_index : run_index + 1].reshape(1, 1, 2, -1)
+                ).unbind(dim=2)
+                encoder_hidden_states = context[batch_index : batch_index + 1] * (1 + scale_kv) + shift_kv
+
+                chunk_mask = None
+                if context_mask is not None:
+                    chunk_mask = context_mask[batch_index : batch_index + 1].expand(-1, -1, run_length, -1)
+
+                output[batch_index : batch_index + 1, run_start:run_end] = apply_prompt_run(
+                    attn_input[batch_index : batch_index + 1, run_start:run_end],
+                    encoder_hidden_states,
+                    chunk_mask,
+                )
+                run_start = run_end
+
+            if run_start != query_len:
+                raise ValueError(
+                    'Per-query prompt conditioning run lengths must cover the full query length. '
+                    f'Covered {run_start} tokens for query length {query_len}.'
+                )
+            continue
+
+        if prompt_timestep.shape[1] != query_len:
+            raise ValueError(
+                "Per-query prompt conditioning requires one prompt timestep per query token. "
+                f"Got prompt length {prompt_timestep.shape[1]} for query length {query_len}."
+            )
+
+        sample_prompt_timestep = prompt_timestep[batch_index]
         while run_start < query_len:
             run_end = run_start + 1
             while run_end < query_len and torch.equal(
@@ -439,10 +716,10 @@ def apply_cross_attention_adaln(
             if context_mask is not None:
                 chunk_mask = context_mask[batch_index : batch_index + 1].expand(-1, -1, run_end - run_start, -1)
 
-            output[batch_index : batch_index + 1, run_start:run_end] = attn(
+            output[batch_index : batch_index + 1, run_start:run_end] = apply_prompt_run(
                 attn_input[batch_index : batch_index + 1, run_start:run_end],
-                context=encoder_hidden_states,
-                mask=chunk_mask,
+                encoder_hidden_states,
+                chunk_mask,
             )
             run_start = run_end
 

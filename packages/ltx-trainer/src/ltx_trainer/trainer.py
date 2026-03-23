@@ -182,16 +182,17 @@ class LtxvTrainer:
                         self._global_step += 1
 
                     if self._is_dual_stage_ode_training():
-                        loss, loss_metrics = self._compute_dual_stage_ode_loss(batch_stage1, batch_stage2)
+                        loss_metrics = self._backward_dual_stage_ode_losses(batch_stage1, batch_stage2)
                         loss_scalar = loss_metrics["total_loss"]
                         accumulated_stage1_loss += loss_metrics["stage1_loss"]
                         accumulated_stage2_loss += loss_metrics["stage2_loss"]
+                        loss = None
                     else:
                         loss = self._training_step(batch)
                         loss_scalar = float(loss.detach().item())
+                        self._accelerator.backward(loss)
                     accumulated_loss += loss_scalar
                     accumulation_count += 1
-                    self._accelerator.backward(loss)
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         self._accelerator.clip_grad_norm_(
@@ -412,6 +413,21 @@ class LtxvTrainer:
             self._config.training_strategy.dual_stage_training
         )
 
+    def _effective_gradient_checkpointing_enabled(self) -> bool:
+        """Return whether transformer gradient checkpointing should remain enabled."""
+        if not self._config.optimization.enable_gradient_checkpointing:
+            return False
+
+        strategy_config = self._config.training_strategy
+        if isinstance(strategy_config, ODERegressionConfig) and strategy_config.use_block_causal_mask:
+            logger.warning(
+                "Disabling transformer gradient checkpointing for block-causal ODE regression. "
+                "This path currently triggers checkpoint metadata mismatches during backward."
+            )
+            return False
+
+        return True
+
     def _compute_dual_stage_ode_loss(
         self,
         batch_stage1: dict[str, dict[str, Tensor]],
@@ -426,6 +442,29 @@ class LtxvTrainer:
         stage2_loss = self._training_step(batch_stage2)
         total_loss = strategy_config.stage1_loss_weight * stage1_loss + strategy_config.stage2_loss_weight * stage2_loss
         return total_loss, {
+            "stage1_loss": float(stage1_loss.detach().item()),
+            "stage2_loss": float(stage2_loss.detach().item()),
+            "total_loss": float(total_loss.detach().item()),
+        }
+
+    def _backward_dual_stage_ode_losses(
+        self,
+        batch_stage1: dict[str, dict[str, Tensor]],
+        batch_stage2: dict[str, dict[str, Tensor]],
+    ) -> dict[str, float]:
+        """Backward stage1 and stage2 losses separately to avoid holding both graphs at once."""
+        strategy_config = self._config.training_strategy
+        if not isinstance(strategy_config, ODERegressionConfig) or not strategy_config.dual_stage_training:
+            raise ValueError("_backward_dual_stage_ode_losses requires dual-stage ODE regression training.")
+
+        stage1_loss = self._training_step(batch_stage1)
+        self._accelerator.backward(strategy_config.stage1_loss_weight * stage1_loss)
+
+        stage2_loss = self._training_step(batch_stage2)
+        self._accelerator.backward(strategy_config.stage2_loss_weight * stage2_loss)
+
+        total_loss = strategy_config.stage1_loss_weight * stage1_loss + strategy_config.stage2_loss_weight * stage2_loss
+        return {
             "stage1_loss": float(stage1_loss.detach().item()),
             "stage2_loss": float(stage2_loss.detach().item()),
             "total_loss": float(total_loss.detach().item()),
@@ -536,7 +575,16 @@ class LtxvTrainer:
         # Determine initial dtype based on training mode.
         # Note: For FSDP + LoRA, we'll cast to FP32 later in _prepare_models_for_training()
         # after the accelerator is set up, and we can detect FSDP.
-        transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
+        if self._config.model.training_mode == "full":
+            mixed_precision_mode = self._config.acceleration.mixed_precision_mode
+            if mixed_precision_mode == "fp16":
+                transformer_dtype = torch.float16
+            elif mixed_precision_mode == "bf16":
+                transformer_dtype = torch.bfloat16
+            else:
+                transformer_dtype = torch.float32
+        else:
+            transformer_dtype = torch.bfloat16
         self._transformer = self._transformer.to(dtype=transformer_dtype)
 
         if self._config.acceleration.quantization is not None:
@@ -648,7 +696,7 @@ class LtxvTrainer:
             self._transformer.get_base_model() if hasattr(self._transformer, "get_base_model") else self._transformer
         )
 
-        transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
+        transformer.set_gradient_checkpointing(self._effective_gradient_checkpointing_enabled())
 
         # Keep frozen models on CPU for memory efficiency
         self._vae_decoder = self._vae_decoder.to("cpu")

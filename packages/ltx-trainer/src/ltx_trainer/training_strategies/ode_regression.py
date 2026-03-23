@@ -27,7 +27,7 @@ except ImportError:
     BlockMask = None  # type: ignore[assignment]
     create_block_mask = None
 
-from ltx_core.model.transformer.modality import Modality
+from ltx_core.model.transformer.modality import CrossAttentionChunkPlan, Modality
 from ltx_trainer import logger
 from ltx_trainer.ode_block_layout import (
     build_audio_block_ends,
@@ -61,6 +61,8 @@ class BlockCausalMasks:
     audio_self: Tensor | BlockMask | None
     video_to_audio: Tensor | BlockMask | None
     audio_to_video: Tensor | BlockMask | None
+    video_to_audio_plan: CrossAttentionChunkPlan | None = None
+    audio_to_video_plan: CrossAttentionChunkPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -345,6 +347,7 @@ class ODERegressionStrategy(TrainingStrategy):
             context=video_prompt_embeds,
             context_mask=prompt_attention_mask,
             attention_mask=causal_masks.video_self if causal_masks is not None else None,
+            cross_attention_chunk_plan=causal_masks.video_to_audio_plan if causal_masks is not None else None,
             cross_attention_mask=causal_masks.video_to_audio if causal_masks is not None else None,
             prompt_sigma=prepared_video.token_sigmas,
         )
@@ -363,6 +366,7 @@ class ODERegressionStrategy(TrainingStrategy):
                 context=audio_prompt_embeds,
                 context_mask=prompt_attention_mask,
                 attention_mask=causal_masks.audio_self if causal_masks is not None else None,
+                cross_attention_chunk_plan=causal_masks.audio_to_video_plan if causal_masks is not None else None,
                 cross_attention_mask=causal_masks.audio_to_video if causal_masks is not None else None,
                 sink_token_count=self.config.audio_sink_token_count,
                 prompt_sigma=audio_inputs.token_sigmas,
@@ -742,7 +746,23 @@ class ODERegressionStrategy(TrainingStrategy):
             device=device,
             target_unit_size=avg_audio_tokens_per_block,
         )
+        video_to_audio_plan = self._create_cross_attention_chunk_plan(
+            src_len=video_seq_len,
+            target_len=audio_seq_len,
+            src_block_ends=video_block_ends,
+            target_block_ends=audio_block_ends,
+            device=device,
+            target_unit_size=avg_audio_tokens_per_block,
+        )
         audio_to_video_mask = self._create_cross_block_mask(
+            src_len=audio_seq_len,
+            target_len=video_seq_len,
+            src_block_ends=audio_block_ends,
+            target_block_ends=video_block_ends,
+            device=device,
+            target_unit_size=video_tokens_per_frame,
+        )
+        audio_to_video_plan = self._create_cross_attention_chunk_plan(
             src_len=audio_seq_len,
             target_len=video_seq_len,
             src_block_ends=audio_block_ends,
@@ -756,6 +776,8 @@ class ODERegressionStrategy(TrainingStrategy):
             audio_self=audio_self_mask,
             video_to_audio=video_to_audio_mask,
             audio_to_video=audio_to_video_mask,
+            video_to_audio_plan=video_to_audio_plan,
+            audio_to_video_plan=audio_to_video_plan,
         )
 
     def _build_video_block_ranges(self, num_frames: int) -> list[tuple[int, int]]:
@@ -824,6 +846,37 @@ class ODERegressionStrategy(TrainingStrategy):
             return visible & (kv_idx >= (expanded_target_ends[q_idx] - local_window))
 
         return create_block_mask(mask_fn, B=None, H=None, Q_LEN=src_len, KV_LEN=target_len, device=device, _compile=False)
+
+    def _create_cross_attention_chunk_plan(
+        self,
+        src_len: int,
+        target_len: int,
+        src_block_ends: Tensor,
+        target_block_ends: Tensor,
+        device: torch.device,
+        target_unit_size: float,
+    ) -> CrossAttentionChunkPlan:
+        query_block_ends = src_block_ends.to(device=device, dtype=torch.long)
+        target_ends = target_block_ends.to(device=device, dtype=torch.long).clamp(min=0, max=target_len)
+        if query_block_ends.numel() == 0 or target_ends.numel() == 0:
+            raise ValueError('Cross-attention chunk plan requires at least one source and target block.')
+        if query_block_ends.shape != target_ends.shape:
+            raise ValueError(
+                'Cross-attention chunk plan expects matching source/target block layouts. '
+                f'Got source {tuple(query_block_ends.shape)} and target {tuple(target_ends.shape)}.'
+            )
+        if int(query_block_ends[-1].item()) != src_len:
+            raise ValueError(f'Cross-attention chunk plan must cover the full source length {src_len}.')
+        if int(target_ends[-1].item()) != target_len:
+            raise ValueError(f'Cross-attention chunk plan must cover the full target length {target_len}.')
+
+        local_window = self._resolve_local_window_tokens(target_unit_size)
+        if local_window is None:
+            target_starts = torch.zeros_like(target_ends)
+        else:
+            target_starts = torch.clamp(target_ends - local_window, min=0)
+
+        return CrossAttentionChunkPlan(query_block_ends=query_block_ends, target_starts=target_starts, target_ends=target_ends)
 
     @staticmethod
     def _expand_block_ends(

@@ -12,6 +12,13 @@ else:
 
 
 @dataclass(frozen=True)
+class CrossAttentionChunkPlan:
+    query_block_ends: torch.Tensor
+    target_starts: torch.Tensor
+    target_ends: torch.Tensor
+
+
+@dataclass(frozen=True)
 class Modality:
     """
     Input data for a single modality (video or audio) in the transformer.
@@ -47,5 +54,6 @@ class Modality:
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | BlockMask | None = None
     cross_attention_mask: torch.Tensor | BlockMask | None = None
+    cross_attention_chunk_plan: CrossAttentionChunkPlan | None = None
     sink_token_count: int = 0
     prompt_sigma: torch.Tensor | None = None

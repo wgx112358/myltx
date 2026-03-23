@@ -33,6 +33,7 @@ def _make_base_config(tmp_path: Path) -> dict:
         "optimization": {
             "steps": 1,
             "batch_size": 1,
+            "enable_gradient_checkpointing": True,
         },
         "data": {
             "preprocessed_data_root_stage1": "/tmp/ode_stage1",
@@ -81,6 +82,53 @@ def test_compute_dual_stage_ode_loss_applies_stage_weights(tmp_path: Path) -> No
     )
 
     assert torch.isclose(total_loss, torch.tensor(6.5))
+    assert metrics == {
+        "stage1_loss": 2.0,
+        "stage2_loss": 3.0,
+        "total_loss": 6.5,
+    }
+
+
+def test_effective_gradient_checkpointing_is_disabled_for_block_causal_ode(tmp_path: Path) -> None:
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = LtxTrainerConfig.model_validate(_make_base_config(tmp_path))
+
+    assert trainer._effective_gradient_checkpointing_enabled() is False
+
+
+def test_effective_gradient_checkpointing_respects_config_when_block_causal_is_disabled(tmp_path: Path) -> None:
+    config = _make_base_config(tmp_path)
+    config["training_strategy"]["use_block_causal_mask"] = False
+
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = LtxTrainerConfig.model_validate(config)
+
+    assert trainer._effective_gradient_checkpointing_enabled() is True
+
+
+def test_backward_dual_stage_ode_losses_applies_stage_weights_separately(tmp_path: Path) -> None:
+    trainer = object.__new__(LtxvTrainer)
+    trainer._config = LtxTrainerConfig.model_validate(_make_base_config(tmp_path))
+
+    class FakeAccelerator:
+        def __init__(self) -> None:
+            self.backward_calls: list[float] = []
+
+        def backward(self, loss: torch.Tensor) -> None:
+            self.backward_calls.append(float(loss.detach().item()))
+
+    def fake_training_step(self: LtxvTrainer, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        return batch["loss"]
+
+    trainer._accelerator = FakeAccelerator()
+    trainer._training_step = MethodType(fake_training_step, trainer)
+
+    metrics = trainer._backward_dual_stage_ode_losses(
+        {"loss": torch.tensor(2.0)},
+        {"loss": torch.tensor(3.0)},
+    )
+
+    assert trainer._accelerator.backward_calls == [0.5, 6.0]
     assert metrics == {
         "stage1_loss": 2.0,
         "stage2_loss": 3.0,

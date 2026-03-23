@@ -231,6 +231,74 @@ class Attention(torch.nn.Module):
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
+    def project_query(
+        self,
+        x: torch.Tensor,
+        pe: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        q = self.to_q(x)
+        q = self.q_norm(q)
+        if pe is not None:
+            q = apply_rotary_emb(q, pe, self.rope_type)
+        return q
+
+    def project_context(
+        self,
+        context: torch.Tensor,
+        pe: torch.Tensor | None = None,
+        k_pe: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        v = self.to_v(context)
+        k = self.to_k(context)
+        k = self.k_norm(k)
+        if pe is not None or k_pe is not None:
+            k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+        return k, v
+
+    def _apply_attention_output(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: object | None = None,
+        perturbation_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if _is_block_mask(mask):
+            out = FlexAttention()(q, k, v, self.heads, mask)
+        else:
+            out = self.attention_function(q, k, v, self.heads, mask)
+
+        if perturbation_mask is not None:
+            out = out * perturbation_mask + v * (1 - perturbation_mask)
+
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)  # (B, T, H)
+            b, t, _ = out.shape
+            out = out.view(b, t, self.heads, self.dim_head)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out * gates.unsqueeze(-1)
+            out = out.view(b, t, self.heads * self.dim_head)
+
+        return self.to_out(out)
+
+    def forward_with_preprojected_context(
+        self,
+        x: torch.Tensor,
+        projected_k: torch.Tensor,
+        projected_v: torch.Tensor,
+        mask: object | None = None,
+        pe: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        q = self.project_query(x, pe=pe)
+        return self._apply_attention_output(
+            x,
+            q,
+            projected_k,
+            projected_v,
+            mask=mask,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -268,39 +336,18 @@ class Attention(torch.nn.Module):
         context = x if context is None else context
         use_attention = not all_perturbed
 
-        v = self.to_v(context)
-
         if not use_attention:
-            out = v
+            out = self.to_v(context)
         else:
-            q = self.to_q(x)
-            k = self.to_k(context)
+            q = self.project_query(x, pe=pe)
+            k, v = self.project_context(context, pe=pe, k_pe=k_pe)
+            out = self._apply_attention_output(
+                x,
+                q,
+                k,
+                v,
+                mask=mask,
+                perturbation_mask=perturbation_mask,
+            )
 
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-
-            if pe is not None:
-                q = apply_rotary_emb(q, pe, self.rope_type)
-                k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
-
-            if _is_block_mask(mask):
-                out = FlexAttention()(q, k, v, self.heads, mask)
-            else:
-                out = self.attention_function(q, k, v, self.heads, mask)  # (B, T, H*D)
-
-            if perturbation_mask is not None:
-                out = out * perturbation_mask + v * (1 - perturbation_mask)
-
-        # Apply per-head gating if enabled
-        if self.to_gate_logits is not None:
-            gate_logits = self.to_gate_logits(x)  # (B, T, H)
-            b, t, _ = out.shape
-            # Reshape to (B, T, H, D) for per-head gating
-            out = out.view(b, t, self.heads, self.dim_head)
-            # Apply gating: 2 * sigmoid(x) so that zero-init gives identity (2 * 0.5 = 1.0)
-            gates = 2.0 * torch.sigmoid(gate_logits)  # (B, T, H)
-            out = out * gates.unsqueeze(-1)  # (B, T, H, D) * (B, T, H, 1)
-            # Reshape back to (B, T, H*D)
-            out = out.view(b, t, self.heads * self.dim_head)
-
-        return self.to_out(out)
+        return out

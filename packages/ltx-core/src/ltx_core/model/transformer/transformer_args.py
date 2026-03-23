@@ -9,7 +9,7 @@ except ImportError:
     BlockMask = None  # type: ignore[assignment]
 
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle
-from ltx_core.model.transformer.modality import Modality
+from ltx_core.model.transformer.modality import CrossAttentionChunkPlan, Modality
 from ltx_core.model.transformer.rope import (
     LTXRopeType,
     generate_freq_grid_np,
@@ -32,7 +32,9 @@ class TransformerArgs:
     enabled: bool
     prompt_timestep: torch.Tensor | None = None
     prompt_timestep_is_per_query: bool = False
+    prompt_timestep_run_lengths: torch.Tensor | None = None
     self_attention_mask: torch.Tensor | BlockMask | None = None
+    cross_attention_chunk_plan: CrossAttentionChunkPlan | None = None
     cross_attention_mask: torch.Tensor | BlockMask | None = None
 
 
@@ -81,6 +83,50 @@ class TransformerArgsPreprocessor:
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
 
         return timestep, embedded_timestep
+
+    def _prepare_per_query_prompt_timestep(
+        self,
+        prompt_sigma: torch.Tensor,
+        hidden_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.prompt_adaln is None:
+            raise ValueError('Per-query prompt timestep preparation requires prompt_adaln.')
+
+        prompt_timestep_chunks: list[torch.Tensor] = []
+        run_length_chunks: list[torch.Tensor] = []
+        max_runs = 0
+
+        for sample_prompt_sigma in prompt_sigma:
+            unique_sigmas, run_lengths = torch.unique_consecutive(sample_prompt_sigma, return_counts=True)
+            sample_prompt_timestep, _ = self._prepare_timestep(
+                unique_sigmas.unsqueeze(0),
+                self.prompt_adaln,
+                batch_size=1,
+                hidden_dtype=hidden_dtype,
+            )
+            sample_prompt_timestep = sample_prompt_timestep.squeeze(0)
+            prompt_timestep_chunks.append(sample_prompt_timestep)
+            run_length_chunks.append(run_lengths.to(device=prompt_sigma.device, dtype=torch.long))
+            max_runs = max(max_runs, sample_prompt_timestep.shape[0])
+
+        prompt_timestep = prompt_sigma.new_zeros(
+            (prompt_sigma.shape[0], max_runs, prompt_timestep_chunks[0].shape[-1]),
+            dtype=prompt_timestep_chunks[0].dtype,
+        )
+        prompt_timestep_run_lengths = torch.zeros(
+            (prompt_sigma.shape[0], max_runs),
+            device=prompt_sigma.device,
+            dtype=torch.long,
+        )
+
+        for batch_index, (sample_prompt_timestep, sample_run_lengths) in enumerate(
+            zip(prompt_timestep_chunks, run_length_chunks, strict=True)
+        ):
+            run_count = sample_prompt_timestep.shape[0]
+            prompt_timestep[batch_index, :run_count] = sample_prompt_timestep
+            prompt_timestep_run_lengths[batch_index, :run_count] = sample_run_lengths
+
+        return prompt_timestep, prompt_timestep_run_lengths
 
     def _prepare_context(
         self,
@@ -168,15 +214,22 @@ class TransformerArgsPreprocessor:
         )
         prompt_timestep = None
         prompt_timestep_is_per_query = False
+        prompt_timestep_run_lengths = None
         if self.prompt_adaln is not None:
             prompt_sigma, prompt_timestep_is_per_query = self._resolve_prompt_sigma(
                 modality=modality,
                 batch_size=batch_size,
                 query_len=x.shape[1],
             )
-            prompt_timestep, _ = self._prepare_timestep(
-                prompt_sigma, self.prompt_adaln, batch_size, modality.latent.dtype
-            )
+            if prompt_timestep_is_per_query:
+                prompt_timestep, prompt_timestep_run_lengths = self._prepare_per_query_prompt_timestep(
+                    prompt_sigma,
+                    modality.latent.dtype,
+                )
+            else:
+                prompt_timestep, _ = self._prepare_timestep(
+                    prompt_sigma, self.prompt_adaln, batch_size, modality.latent.dtype
+                )
         context = self._prepare_context(modality.context, x)
         attention_mask = self._prepare_attention_mask(modality.context_mask, modality.latent.dtype)
         pe = self._prepare_positional_embeddings(
@@ -212,7 +265,9 @@ class TransformerArgsPreprocessor:
             enabled=modality.enabled,
             prompt_timestep=prompt_timestep,
             prompt_timestep_is_per_query=prompt_timestep_is_per_query,
+            prompt_timestep_run_lengths=prompt_timestep_run_lengths,
             self_attention_mask=self_attention_mask,
+            cross_attention_chunk_plan=modality.cross_attention_chunk_plan,
             cross_attention_mask=cross_attention_mask,
         )
 
