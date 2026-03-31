@@ -1,0 +1,65 @@
+[ode_pipe_distilled] [1/8] idx=01681 seed=5534811387362042849 prompt=A faded mint delivery van runs along a coastal road in a tel...
+WARNING  Uninitialized parameters or buffers:    single_gpu_model_builder.py:152
+         ['audio_sink_token']; materializing                                    
+         them with zeros on cuda                                                
+INFO     Video saved to                                          media_io.py:234
+         /workspace/ode_infer_outputs/visual_multi_compare/ode_p                
+         ipe_distilled/ode_pipe_distilled_01681.mp4                             
+  Saved: /workspace/ode_infer_outputs/visual_multi_compare/ode_pipe_distilled/ode_pipe_distilled_01681.mp4
+[ode_pipe_distilled] [2/8] idx=01951 seed=2622499133903309481 prompt=A macro 85mm view fixes on the brass and steel linkage of a ...
+WARNING  Uninitialized parameters or buffers:    single_gpu_model_builder.py:152
+         ['audio_sink_token']; materializing                                    
+         them with zeros on cuda                                                
+INFO     Video saved to                                          media_io.py:234
+         /workspace/ode_infer_outputs/visual_multi_compare/ode_p                
+         ipe_distilled/ode_pipe_distilled_01951.mp4                             
+  Saved: /workspace/ode_infer_outputs/visual_multi_compare/ode_pipe_distilled/ode_pipe_distilled_01951.mp4
+[ode_pipe_distilled] [3/8] idx=03658 seed=1743503568534534955 prompt=A brass pocket compass lies open on a scarred wooden bench, ...
+WARNING  Uninitialized parameters or buffers:    single_gpu_model_builder.py:152
+         ['audio_sink_token']; materializing                                    
+         them with zeros on cuda                                                
+INFO     Video saved to                                          media_io.py:234
+         /workspace/ode_infer_outputs/visual_multi_compare/ode_p                
+         ipe_distilled/ode_pipe_distilled_03658.mp4                             
+  Saved: /workspace/ode_infer_outputs/visual_multi_compare/ode_pipe_distilled/ode_pipe_distilled_03658.mp4
+[ode_pipe_distilled] [4/8] idx=05234 seed=6053330647666881343 prompt=A claymation-like miniature animation holds a fixed horizon-...
+WARNING  Uninitialized parameters or buffers:    single_gpu_model_builder.py:152
+         ['audio_sink_token']; materializing                                    
+         them with zeros on cuda                                                
+INFO     Video saved to                                          media_io.py:234
+         /workspace/ode_infer_outputs/visual_multi_compare/ode_p                
+         ipe_distilled/ode_pipe_distilled_05234.mp4                             
+  Saved: /workspace/ode_infer_outputs/visual_multi_compare/ode_pipe_distilled/ode_pipe_distilled_05234.mp4
+[ode_pipe_distilled] [5/8] idx=08233 seed=7571536020167563083 prompt=A side-on naturalistic documentary view holds on an industri...
+WARNING  Uninitialized parameters or buffers:    single_gpu_model_builder.py:152
+         ['audio_sink_token']; materializing                                    
+         them with zeros on cuda                                                
+INFO     Video saved to                                          media_io.py:234
+         /workspace/ode_infer_outputs/visual_multi_compare/ode_p                
+         ipe_distilled/ode_pipe_distilled_08233.mp4                             
+  Saved: /workspace/ode_infer_outputs/visual_multi_compare/ode_pipe_distilled/ode_pipe_distilled_08233.mp4
+[ode_pipe_distilled] [6/8] idx=08385 seed=6160866177649411101 prompt=A low-angle macro view presses toward a ridge of wind-carved...
+WARNING  Uninitialized parameters or buffers:    single_gpu_model_builder.py:152
+         ['audio_sink_token']; materializing                                    
+         them with zeros on cuda                                                
+INFO     Video saved to                                          media_io.py:234
+         /workspace/ode_infer_outputs/visual_multi_compare/ode_p                
+         ipe_distilled/ode_pipe_distilled_08385.mp4                             
+  Saved: /workspace/ode_infer_outputs/visual_multi_compare/ode_pipe_distilled/ode_pipe_distilled_08385.mp4
+[ode_pipe_distilled] [7/8] idx=09847 seed=1830658909911904863 prompt=A stylized 3D animated host walks beside a compact studio de...
+WARNING  Uninitialized parameters or buffers:    single_gpu_model_builder.py:152
+         ['audio_sink_token']; materializing                                    
+         them with zeros on cuda                                                
+INFO     Video saved to                                          media_io.py:234
+         /workspace/ode_infer_outputs/visual_multi_compare/ode_p                
+         ipe_distilled/ode_pipe_distilled_09847.mp4                             
+  Saved: /workspace/ode_infer_outputs/visual_multi_compare/ode_pipe_distilled/ode_pipe_distilled_09847.mp4
+[ode_pipe_distilled] [8/8] idx=10603 seed=2381425985595360542 prompt=A claymation-like miniature animation wide shot surveys a ro...
+WARNING  Uninitialized parameters or buffers:    single_gpu_model_builder.py:152
+         ['audio_sink_token']; materializing                                    
+         them with zeros on cuda                                                
+INFO     Video saved to                                          media_io.py:234
+         /workspace/ode_infer_outputs/visual_multi_compare/ode_p                
+         ipe_distilled/ode_pipe_distilled_10603.mp4                             
+  Saved: /workspace/ode_infer_outputs/visual_multi_compare/ode_pipe_distilled/ode_pipe_distilled_10603.mp4
+[ode_pipe_distilled] Done.

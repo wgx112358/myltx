@@ -1,0 +1,38 @@
+bash: warning: setlocale: LC_ALL: cannot change locale (C.UTF-8)
+WARNING: Environment variable PROMPT_COMMAND already has value [], will not forward new value [{ msg=$(history 1 | { read x y; echo $y; }); logger "[euid=$(whoami)]":$(who am i):[`pwd`]"$msg";}] from parent process environment
+WARNING: While bind mounting '/mnt/petrelfs/wanggongxuan/workspace:/workspace': destination is already in the mount point list
+2026-03-30 22:10:31,219 - WARNING - Uninitialized parameters or buffers: ['audio_sink_token']; materializing them with zeros on cuda
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:03,  1.56s/it] 67%|██████▋   | 2/3 [00:08<00:04,  4.94s/it]100%|██████████| 3/3 [00:11<00:00,  3.92s/it]100%|██████████| 3/3 [00:11<00:00,  3.86s/it]
+2026-03-30 22:11:03,665 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/pt_decode/pt_decode_01681.mp4
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.42s/it] 67%|██████▋   | 2/3 [00:08<00:04,  4.93s/it]100%|██████████| 3/3 [00:11<00:00,  3.87s/it]100%|██████████| 3/3 [00:11<00:00,  3.80s/it]
+2026-03-30 22:13:05,378 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/replay/replay_01681.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.39s/it] 67%|██████▋   | 2/3 [00:08<00:04,  4.89s/it]100%|██████████| 3/3 [00:11<00:00,  3.78s/it]100%|██████████| 3/3 [00:11<00:00,  3.73s/it]
+2026-03-30 22:13:33,908 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/pt_decode/pt_decode_01951.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.45s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.26s/it]100%|██████████| 3/3 [00:12<00:00,  4.12s/it]100%|██████████| 3/3 [00:12<00:00,  4.05s/it]
+2026-03-30 22:16:30,803 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/replay/replay_01951.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:03,  1.50s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.30s/it]100%|██████████| 3/3 [00:12<00:00,  4.18s/it]100%|██████████| 3/3 [00:12<00:00,  4.10s/it]
+2026-03-30 22:17:02,227 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/pt_decode/pt_decode_03658.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.42s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.11s/it]100%|██████████| 3/3 [00:12<00:00,  4.21s/it]100%|██████████| 3/3 [00:12<00:00,  4.08s/it]
+2026-03-30 22:19:25,144 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/replay/replay_03658.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.45s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.25s/it]100%|██████████| 3/3 [00:12<00:00,  4.12s/it]100%|██████████| 3/3 [00:12<00:00,  4.04s/it]
+2026-03-30 22:19:56,356 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/pt_decode/pt_decode_05234.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.50s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.32s/it]100%|██████████| 3/3 [00:12<00:00,  4.17s/it]100%|██████████| 3/3 [00:12<00:00,  4.10s/it]
+2026-03-30 22:22:19,391 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/replay/replay_05234.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.45s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.18s/it]100%|██████████| 3/3 [00:12<00:00,  4.11s/it]100%|██████████| 3/3 [00:12<00:00,  4.02s/it]
+2026-03-30 22:22:50,550 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/pt_decode/pt_decode_08233.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.45s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.26s/it]100%|██████████| 3/3 [00:12<00:00,  4.14s/it]100%|██████████| 3/3 [00:12<00:00,  4.07s/it]
+2026-03-30 22:25:14,532 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/replay/replay_08233.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.46s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.25s/it]100%|██████████| 3/3 [00:12<00:00,  4.20s/it]100%|██████████| 3/3 [00:12<00:00,  4.11s/it]
+2026-03-30 22:25:46,225 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/pt_decode/pt_decode_08385.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.45s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.29s/it]100%|██████████| 3/3 [00:12<00:00,  4.12s/it]100%|██████████| 3/3 [00:12<00:00,  4.05s/it]
+2026-03-30 22:28:02,954 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/replay/replay_08385.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.49s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.42s/it]100%|██████████| 3/3 [00:12<00:00,  4.41s/it]100%|██████████| 3/3 [00:12<00:00,  4.29s/it]
+2026-03-30 22:28:34,772 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/pt_decode/pt_decode_09847.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:03,  1.51s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.45s/it]100%|██████████| 3/3 [00:12<00:00,  4.21s/it]100%|██████████| 3/3 [00:12<00:00,  4.15s/it]
+2026-03-30 22:31:01,976 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/replay/replay_09847.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.47s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.45s/it]100%|██████████| 3/3 [00:12<00:00,  4.40s/it]100%|██████████| 3/3 [00:12<00:00,  4.29s/it]
+2026-03-30 22:31:34,399 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/pt_decode/pt_decode_10603.mp4
+  0%|          | 0/3 [00:00<?, ?it/s] 33%|███▎      | 1/3 [00:01<00:02,  1.44s/it] 67%|██████▋   | 2/3 [00:09<00:05,  5.41s/it]100%|██████████| 3/3 [00:12<00:00,  4.36s/it]100%|██████████| 3/3 [00:12<00:00,  4.25s/it]
+2026-03-30 22:33:54,572 - INFO - Video saved to /workspace/ode_infer_outputs/visual_multi_compare/exact_replay/replay/replay_10603.mp4
+[W330 22:33:57.938111196 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())
